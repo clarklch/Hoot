@@ -1,0 +1,16 @@
+# EAS Build ignore file
+# This ensures EAS uses the correct files from your local directory
+
+# Don't ignore package-lock.json - we need it!
+# package-lock.json
+
+# Ignore build artifacts
+node_modules/
+.expo/
+dist/
+web-build/
+
+# Ignore cache
+.npm/
+.cache/
+
