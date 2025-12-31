@@ -18,8 +18,12 @@
       }
     },
     "production": {
+      "distribution": "store",
       "ios": {
         "simulator": false
+      },
+      "env": {
+        "NPM_CONFIG_PACKAGE_LOCK_ONLY": "true"
       }
     }
   },
