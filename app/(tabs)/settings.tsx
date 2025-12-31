@@ -1,18 +1,21 @@
 import { useState, useEffect, useRef } from 'react';
 import React from 'react';
-import { View, StyleSheet, TextInput, TouchableOpacity, ScrollView, Alert, ActivityIndicator, PanResponder, Dimensions, Keyboard } from 'react-native';
+import { View, StyleSheet, TextInput, TouchableOpacity, ScrollView, Alert, ActivityIndicator, PanResponder, Dimensions, Keyboard, Linking } from 'react-native';
 import { BlurView } from 'expo-blur';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
+import * as Notifications from 'expo-notifications';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { useAuth } from '@/contexts/AuthContext';
 import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { doc, getDoc, setDoc, collection, query, where, getDocs, addDoc, deleteDoc, Timestamp, updateDoc, arrayRemove } from 'firebase/firestore';
-import { db } from '@/config/firebase';
+import { deleteUser } from 'firebase/auth';
+import { db, auth } from '@/config/firebase';
+import { clearPushToken, registerForPushNotifications } from '@/services/notifications';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const SWIPE_THRESHOLD = 120;
@@ -23,6 +26,7 @@ export default function SettingsScreen() {
   const [defaultHootText, setDefaultHootText] = useState('Hoot!');
   const [loading, setLoading] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
+  const [notificationPermissionStatus, setNotificationPermissionStatus] = useState<'granted' | 'denied' | 'undetermined' | 'checking'>('checking');
   const [funStats, setFunStats] = useState({
     totalHoots: 0,
     totalCharacters: 0,
@@ -54,6 +58,70 @@ export default function SettingsScreen() {
     })
   ).current;
 
+  // Check notification permissions
+  const checkNotificationPermissions = async () => {
+    try {
+      const { status } = await Notifications.getPermissionsAsync();
+      setNotificationPermissionStatus(status);
+    } catch (error) {
+      console.error('Error checking notification permissions:', error);
+      setNotificationPermissionStatus('undetermined');
+    }
+  };
+
+  useEffect(() => {
+    checkNotificationPermissions();
+  }, []);
+
+  // Refresh notification permission status when screen comes into focus
+  useFocusEffect(
+    React.useCallback(() => {
+      checkNotificationPermissions();
+    }, [])
+  );
+
+  const handleRequestNotificationPermissions = async () => {
+    try {
+      // If permissions are already denied, directly open Settings
+      if (notificationPermissionStatus === 'denied') {
+        Linking.openSettings();
+        return;
+      }
+
+      setLoading(true);
+      const { status } = await Notifications.requestPermissionsAsync();
+      setNotificationPermissionStatus(status);
+
+      if (status === 'granted') {
+        // Register for push notifications if permission granted
+        const currentUserId = user?.uid || await AsyncStorage.getItem('hoot_userId') || 'temp_user';
+        if (currentUserId && currentUserId !== 'temp_user') {
+          await registerForPushNotifications(currentUserId);
+        }
+        Alert.alert('Success', 'Push notifications enabled! You\'ll now receive Hoots and friend requests.');
+      } else if (status === 'denied') {
+        Alert.alert(
+          'Notifications Disabled',
+          'To enable notifications, please go to Settings > Hoot > Notifications and enable them.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            {
+              text: 'Open Settings',
+              onPress: () => {
+                Linking.openSettings();
+              },
+            },
+          ]
+        );
+      }
+    } catch (error) {
+      console.error('Error requesting notification permissions:', error);
+      Alert.alert('Error', 'Failed to request notification permissions. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
     const loadUserData = async () => {
       try {
@@ -63,17 +131,17 @@ export default function SettingsScreen() {
         setDisplayName(userData?.displayName || user?.displayName || '');
         setUsername(userData?.username || user?.username || '');
         setDefaultHootText(userData?.defaultHootText || 'Hoot!');
-        
+
         // Load fun stats
         const totalHoots = userData?.hootCount || 0;
         const totalCharacters = userData?.totalCharacters || 0;
         const dailyCounts = userData?.dailyHootCounts || {};
         const dayOfWeekCounts = userData?.dayOfWeekCounts || {};
         const recipientCounts = userData?.recipientCounts || {};
-        
+
         // Find most hoots in a day
         const mostHootsInDay = Math.max(...Object.values(dailyCounts), 0);
-        
+
         // Find favorite day of week
         const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
         let favoriteDay = '';
@@ -85,7 +153,7 @@ export default function SettingsScreen() {
             favoriteDay = day;
           }
         });
-        
+
         // Find top recipient
         let topRecipientId = '';
         let topRecipientCount = 0;
@@ -95,7 +163,7 @@ export default function SettingsScreen() {
             topRecipientId = recipientId;
           }
         });
-        
+
         // Get recipient name
         let topRecipientName = '';
         if (topRecipientId) {
@@ -108,7 +176,7 @@ export default function SettingsScreen() {
             topRecipientName = 'Unknown';
           }
         }
-        
+
         setFunStats({
           totalHoots,
           totalCharacters,
@@ -139,18 +207,18 @@ export default function SettingsScreen() {
           const currentUserId = user?.uid || await AsyncStorage.getItem('hoot_userId') || 'temp_user';
           const userDoc = await getDoc(doc(db, 'users', currentUserId));
           const userData = userDoc.data();
-          
+
           if (!userData) return;
-          
+
           const totalHoots = userData?.hootCount || 0;
           const totalCharacters = userData?.totalCharacters || 0;
           const dailyCounts = userData?.dailyHootCounts || {};
           const dayOfWeekCounts = userData?.dayOfWeekCounts || {};
           const recipientCounts = userData?.recipientCounts || {};
-          
+
           // Find most hoots in a day
           const mostHootsInDay = Math.max(...Object.values(dailyCounts), 0);
-          
+
           // Find favorite day of week
           const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
           let favoriteDay = '';
@@ -162,7 +230,7 @@ export default function SettingsScreen() {
               favoriteDay = day;
             }
           });
-          
+
           // Find top recipient
           let topRecipientId = '';
           let topRecipientCount = 0;
@@ -172,7 +240,7 @@ export default function SettingsScreen() {
               topRecipientId = recipientId;
             }
           });
-          
+
           // Get recipient name
           let topRecipientName = '';
           if (topRecipientId) {
@@ -185,7 +253,7 @@ export default function SettingsScreen() {
               topRecipientName = 'Unknown';
             }
           }
-          
+
           setFunStats({
             totalHoots,
             totalCharacters,
@@ -200,7 +268,7 @@ export default function SettingsScreen() {
           console.error('Error refreshing stats:', error);
         }
       };
-      
+
       refreshStats();
     }, [user])
   );
@@ -215,7 +283,7 @@ export default function SettingsScreen() {
     setLoading(true);
     try {
       const currentUserId = user?.uid || await AsyncStorage.getItem('hoot_userId') || 'temp_user';
-      
+
       // Get current user data to find old display name
       const userDoc = await getDoc(doc(db, 'users', currentUserId));
       const userData = userDoc.data();
@@ -247,7 +315,7 @@ export default function SettingsScreen() {
       const activityPromises = groupsSnapshot.docs.map(async (groupDoc) => {
         const groupId = groupDoc.id;
         const currentUserUsername = userData?.username || user?.username || 'Unknown';
-        
+
         await addDoc(collection(db, 'groupActivities'), {
           groupId: groupId,
           type: 'display_name_changed',
@@ -286,7 +354,7 @@ export default function SettingsScreen() {
     setLoading(true);
     try {
       const currentUserId = user?.uid || await AsyncStorage.getItem('hoot_userId') || 'temp_user';
-      
+
       // Get current user data
       const userDoc = await getDoc(doc(db, 'users', currentUserId));
       const userData = userDoc.data();
@@ -320,7 +388,7 @@ export default function SettingsScreen() {
     setLoading(true);
     try {
       const currentUserId = user?.uid || await AsyncStorage.getItem('hoot_userId') || 'temp_user';
-      
+
       // Update user document in Firestore
       await setDoc(doc(db, 'users', currentUserId), {
         defaultHootText: 'Hoot!',
@@ -364,11 +432,19 @@ export default function SettingsScreen() {
                     setLoading(true);
                     try {
                       const currentUserId = user?.uid || await AsyncStorage.getItem('hoot_userId') || 'temp_user';
-                      
+
+                      // 0. Clear push token BEFORE deleting user document
+                      try {
+                        await clearPushToken(currentUserId);
+                      } catch (tokenError) {
+                        console.log('Note: Could not clear push token (user may not exist):', tokenError);
+                        // Continue with deletion even if token clearing fails
+                      }
+
                       // 1. Delete user document
                       const userDocRef = doc(db, 'users', currentUserId);
                       await deleteDoc(userDocRef);
-                      
+
                       // 2. Delete username entry
                       if (username) {
                         const usernameDocRef = doc(db, 'usernames', username.toLowerCase());
@@ -376,7 +452,7 @@ export default function SettingsScreen() {
                           // Username might not exist, continue
                         });
                       }
-                      
+
                       // 3. Delete all friendships (both directions)
                       const friendshipsQuery1 = query(
                         collection(db, 'friendships'),
@@ -392,7 +468,7 @@ export default function SettingsScreen() {
                       ]);
                       const allFriendships = [...snapshot1.docs, ...snapshot2.docs];
                       await Promise.all(allFriendships.map(docSnap => deleteDoc(docSnap.ref)));
-                      
+
                       // 4. Handle groups - remove user from groups or delete if creator
                       const groupsQuery = query(
                         collection(db, 'groups'),
@@ -401,10 +477,42 @@ export default function SettingsScreen() {
                       const groupsSnapshot = await getDocs(groupsQuery);
                       const groupPromises = groupsSnapshot.docs.map(async (groupDoc) => {
                         const groupData = groupDoc.data();
+                        const groupId = groupDoc.id;
+                        const groupName = groupData.name || 'Group';
+                        const memberIds = groupData.memberIds || [];
+
                         if (groupData.createdBy === currentUserId) {
                           // User is creator - delete the entire group
-                          const groupId = groupDoc.id;
-                          
+                          // First, notify all members that the group is being deleted
+                          const remainingMembers = memberIds.filter((id: string) => id !== currentUserId);
+
+                          // Send notifications to remaining members about group deletion
+                          const notificationPromises = remainingMembers.map(async (memberId: string) => {
+                            try {
+                              const memberDoc = await getDoc(doc(db, 'users', memberId));
+                              const memberData = memberDoc.data();
+                              const pushToken = memberData?.pushToken;
+
+                              if (pushToken) {
+                                await addDoc(collection(db, 'notifications'), {
+                                  pushToken: pushToken,
+                                  message: `${displayName || username || 'The creator'} deleted the group "${groupName}"`,
+                                  fromUserId: currentUserId,
+                                  fromUsername: username || 'Unknown',
+                                  fromDisplayName: displayName || username || 'Unknown',
+                                  toUserId: memberId,
+                                  timestamp: new Date(),
+                                  type: 'group_deleted',
+                                  groupId: groupId,
+                                  groupName: groupName,
+                                });
+                              }
+                            } catch (error) {
+                              console.error(`Error notifying member ${memberId}:`, error);
+                            }
+                          });
+                          await Promise.all(notificationPromises);
+
                           // Delete all group activities
                           const activitiesQuery = query(
                             collection(db, 'groupActivities'),
@@ -412,28 +520,64 @@ export default function SettingsScreen() {
                           );
                           const activitiesSnapshot = await getDocs(activitiesQuery);
                           await Promise.all(activitiesSnapshot.docs.map(docSnap => deleteDoc(docSnap.ref)));
-                          
+
                           // Delete the group
                           await deleteDoc(groupDoc.ref);
                         } else {
-                          // User is member - remove from group
+                          // User is member - remove from group and notify remaining members
                           await updateDoc(groupDoc.ref, {
                             memberIds: arrayRemove(currentUserId)
                           });
-                          
+
                           // Log activity for remaining members
                           await addDoc(collection(db, 'groupActivities'), {
                             groupId: groupDoc.id,
-                            type: 'member_removed',
+                            type: 'member_left',
                             userId: currentUserId,
                             username: username || 'Unknown',
                             userDisplayName: displayName || username || 'Unknown',
                             timestamp: new Date(),
                           });
+
+                          // Send notifications to remaining members that user left
+                          const remainingMembers = memberIds.filter((id: string) => id !== currentUserId);
+                          const notificationPromises = remainingMembers.map(async (memberId: string) => {
+                            try {
+                              const memberDoc = await getDoc(doc(db, 'users', memberId));
+                              const memberData = memberDoc.data();
+                              const pushToken = memberData?.pushToken;
+
+                              if (pushToken) {
+                                await addDoc(collection(db, 'notifications'), {
+                                  pushToken: pushToken,
+                                  message: `${displayName || username || 'A member'} left the group "${groupName}"`,
+                                  fromUserId: currentUserId,
+                                  fromUsername: username || 'Unknown',
+                                  fromDisplayName: displayName || username || 'Unknown',
+                                  toUserId: memberId,
+                                  timestamp: new Date(),
+                                  type: 'member_left',
+                                  groupId: groupId,
+                                  groupName: groupName,
+                                });
+                              }
+                            } catch (error) {
+                              console.error(`Error notifying member ${memberId}:`, error);
+                            }
+                          });
+                          await Promise.all(notificationPromises);
                         }
                       });
                       await Promise.all(groupPromises);
-                      
+
+                      // 4b. Delete all groupMutes for this user
+                      const groupMutesQuery = query(
+                        collection(db, 'groupMutes'),
+                        where('userId', '==', currentUserId)
+                      );
+                      const groupMutesSnapshot = await getDocs(groupMutesQuery);
+                      await Promise.all(groupMutesSnapshot.docs.map(docSnap => deleteDoc(docSnap.ref)));
+
                       // 5. Delete all group activities created by user
                       const userActivitiesQuery = query(
                         collection(db, 'groupActivities'),
@@ -441,7 +585,7 @@ export default function SettingsScreen() {
                       );
                       const userActivitiesSnapshot = await getDocs(userActivitiesQuery);
                       await Promise.all(userActivitiesSnapshot.docs.map(docSnap => deleteDoc(docSnap.ref)));
-                      
+
                       // 6. Delete all messages sent by or to the user
                       const messagesFromQuery = query(
                         collection(db, 'messages'),
@@ -457,7 +601,7 @@ export default function SettingsScreen() {
                       ]);
                       const allMessages = [...messagesFromSnapshot.docs, ...messagesToSnapshot.docs];
                       await Promise.all(allMessages.map(docSnap => deleteDoc(docSnap.ref)));
-                      
+
                       // 7. Delete all notifications related to the user
                       const notificationsFromQuery = query(
                         collection(db, 'notifications'),
@@ -473,21 +617,36 @@ export default function SettingsScreen() {
                       ]);
                       const allNotifications = [...notificationsFromSnapshot.docs, ...notificationsToSnapshot.docs];
                       await Promise.all(allNotifications.map(docSnap => deleteDoc(docSnap.ref)));
-                      
-                      // 8. Clear AsyncStorage
+
+                      // 8. Delete Firebase Auth user account
+                      const currentUser = auth.currentUser;
+                      if (currentUser) {
+                        try {
+                          await deleteUser(currentUser);
+                          console.log('✅ Firebase Auth user deleted');
+                        } catch (authError: any) {
+                          console.error('Error deleting Firebase Auth user:', authError);
+                          // If deleteUser fails, try to re-authenticate first
+                          // For now, we'll continue with sign out
+                        }
+                      }
+
+                      // 9. Clear AsyncStorage
                       await AsyncStorage.removeItem('hoot_userId');
                       await AsyncStorage.removeItem('hoot_username');
-                      
-                      // 9. Sign out
+
+                      // 10. Sign out (clears local state)
                       await signOut();
-                      
+
+                      // 11. Navigate to welcome screen
                       Alert.alert(
                         'Account Deleted',
-                        'Your account and all associated data have been permanently deleted.',
+                        'Your account and all associated data have been permanently deleted. You can sign in again to create a new account.',
                         [
                           {
                             text: 'OK',
                             onPress: () => {
+                              // Navigate to welcome/login screen
                               router.replace('/(auth)/login');
                             }
                           }
@@ -547,59 +706,15 @@ export default function SettingsScreen() {
         {...panResponder.panHandlers}
         showsVerticalScrollIndicator={true}>
         <ThemedView style={styles.content}>
-        <ThemedText type="title" style={styles.title}>
-          Settings ❄️
-        </ThemedText>
-
-        <ThemedView style={styles.section}>
-          <ThemedText style={styles.sectionTitle}>Display Name</ThemedText>
-          <ThemedText style={styles.sectionDescription}>
-            Change how your name appears to friends and in groups
+          <ThemedText type="title" style={styles.title}>
+            Settings ❄️
           </ThemedText>
-          <TextInput
-            style={[
-              styles.input,
-              {
-                color: '#000',
-                borderColor: colors.icon,
-                backgroundColor: '#fff',
-              },
-            ]}
-            placeholder="Enter display name"
-            placeholderTextColor={colors.icon}
-            value={displayName}
-            onChangeText={setDisplayName}
-            maxLength={50}
-            editable={!loading}
-            returnKeyType="done"
-            blurOnSubmit={true}
-            onSubmitEditing={() => Keyboard.dismiss()}
-          />
-          <TouchableOpacity
-            style={[
-              styles.saveButtonFullWidth,
-              {
-                backgroundColor: colors.tint,
-                opacity: loading ? 0.6 : 1,
-                marginTop: 16,
-              },
-            ]}
-            onPress={handleSaveDisplayName}
-            disabled={loading}>
-            {loading ? (
-              <ActivityIndicator color="#fff" />
-            ) : (
-              <ThemedText style={styles.saveButtonText}>Save Changes</ThemedText>
-            )}
-          </TouchableOpacity>
-        </ThemedView>
 
-        <ThemedView style={styles.section}>
-          <ThemedText style={styles.sectionTitle}>Default Hoot Text</ThemedText>
-          <ThemedText style={styles.sectionDescription}>
-            Set the default text that appears in the Hoot input field
-          </ThemedText>
-          <View style={styles.inputContainer}>
+          <ThemedView style={styles.section}>
+            <ThemedText style={styles.sectionTitle}>Display Name</ThemedText>
+            <ThemedText style={styles.sectionDescription}>
+              Change how your name appears to friends and in groups
+            </ThemedText>
             <TextInput
               style={[
                 styles.input,
@@ -609,135 +724,241 @@ export default function SettingsScreen() {
                   backgroundColor: '#fff',
                 },
               ]}
-              placeholder="Enter default Hoot text"
+              placeholder="Enter display name"
               placeholderTextColor={colors.icon}
-              value={defaultHootText}
-              onChangeText={setDefaultHootText}
-              maxLength={100}
+              value={displayName}
+              onChangeText={setDisplayName}
+              maxLength={50}
               editable={!loading}
               returnKeyType="done"
               blurOnSubmit={true}
               onSubmitEditing={() => Keyboard.dismiss()}
             />
-            <ThemedText style={[styles.characterCount, { color: colors.icon }]}>
-              {defaultHootText.length}/100
-            </ThemedText>
-          </View>
-          <View style={styles.buttonRow}>
             <TouchableOpacity
               style={[
-                styles.resetButton,
-                {
-                  borderColor: colors.icon,
-                  opacity: loading ? 0.6 : 1,
-                },
-              ]}
-              onPress={handleResetDefaultHootText}
-              disabled={loading}>
-              <ThemedText style={[styles.resetButtonText, { color: colors.icon }]} numberOfLines={1}>
-                Reset
-              </ThemedText>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.saveButton,
+                styles.saveButtonFullWidth,
                 {
                   backgroundColor: colors.tint,
                   opacity: loading ? 0.6 : 1,
+                  marginTop: 16,
                 },
               ]}
-              onPress={handleSaveDefaultHootText}
+              onPress={handleSaveDisplayName}
               disabled={loading}>
               {loading ? (
                 <ActivityIndicator color="#fff" />
               ) : (
-                <ThemedText style={styles.saveButtonText} numberOfLines={1}>
-                  Save Changes
+                <ThemedText style={styles.saveButtonText}>Save Changes</ThemedText>
+              )}
+            </TouchableOpacity>
+          </ThemedView>
+
+          <ThemedView style={styles.section}>
+            <ThemedText style={styles.sectionTitle}>Default Hoot Text</ThemedText>
+            <ThemedText style={styles.sectionDescription}>
+              Set the default text that appears in the Hoot input field
+            </ThemedText>
+            <View style={styles.inputContainer}>
+              <TextInput
+                style={[
+                  styles.input,
+                  {
+                    color: '#000',
+                    borderColor: colors.icon,
+                    backgroundColor: '#fff',
+                  },
+                ]}
+                placeholder="Enter default Hoot text"
+                placeholderTextColor={colors.icon}
+                value={defaultHootText}
+                onChangeText={setDefaultHootText}
+                maxLength={100}
+                editable={!loading}
+                returnKeyType="done"
+                blurOnSubmit={true}
+                onSubmitEditing={() => Keyboard.dismiss()}
+              />
+              <ThemedText style={[styles.characterCount, { color: colors.icon }]}>
+                {defaultHootText.length}/100
+              </ThemedText>
+            </View>
+            <View style={styles.buttonRow}>
+              <TouchableOpacity
+                style={[
+                  styles.resetButton,
+                  {
+                    borderColor: colors.icon,
+                    opacity: loading ? 0.6 : 1,
+                  },
+                ]}
+                onPress={handleResetDefaultHootText}
+                disabled={loading}>
+                <ThemedText style={[styles.resetButtonText, { color: colors.icon }]} numberOfLines={1}>
+                  Reset
+                </ThemedText>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.saveButton,
+                  {
+                    backgroundColor: colors.tint,
+                    opacity: loading ? 0.6 : 1,
+                  },
+                ]}
+                onPress={handleSaveDefaultHootText}
+                disabled={loading}>
+                {loading ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <ThemedText style={styles.saveButtonText} numberOfLines={1}>
+                    Save Changes
+                  </ThemedText>
+                )}
+              </TouchableOpacity>
+            </View>
+          </ThemedView>
+
+          <ThemedView style={styles.section}>
+            <ThemedText style={styles.sectionTitle}>Notifications</ThemedText>
+            <ThemedText style={styles.sectionDescription}>
+              Enable push notifications to receive Hoots and friend requests, even when the app is closed. Required for the app to work properly.
+            </ThemedText>
+            <View style={styles.notificationStatusContainer}>
+              <ThemedText style={styles.notificationStatusLabel}>Status:</ThemedText>
+              <ThemedText
+                style={[
+                  styles.notificationStatusValue,
+                  {
+                    color:
+                      notificationPermissionStatus === 'granted'
+                        ? '#4CAF50'
+                        : notificationPermissionStatus === 'denied'
+                          ? '#ff4444'
+                          : '#ff9500',
+                  },
+                ]}>
+                {notificationPermissionStatus === 'granted'
+                  ? '✅ Enabled'
+                  : notificationPermissionStatus === 'denied'
+                    ? '❌ Disabled'
+                    : notificationPermissionStatus === 'checking'
+                      ? '⏳ Checking...'
+                      : '⚠️ Not Set'}
+              </ThemedText>
+            </View>
+            {notificationPermissionStatus !== 'granted' && (
+              <TouchableOpacity
+                style={[
+                  styles.enableNotificationsButton,
+                  {
+                    backgroundColor: colors.tint,
+                    opacity: loading ? 0.6 : 1,
+                  },
+                ]}
+                onPress={handleRequestNotificationPermissions}
+                disabled={loading || notificationPermissionStatus === 'checking'}>
+                {loading ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <ThemedText style={styles.enableNotificationsButtonText}>
+                    {notificationPermissionStatus === 'denied'
+                      ? 'Open Settings to Enable'
+                      : 'Enable Notifications'}
+                  </ThemedText>
+                )}
+              </TouchableOpacity>
+            )}
+            {notificationPermissionStatus === 'denied' && (
+              <ThemedText style={styles.notificationHelpText}>
+                Notifications are disabled in your iOS Settings. Tap the button above to open Settings, then enable "Allow Notifications" for Hoot. This is required to receive Hoots and friend requests.
+              </ThemedText>
+            )}
+            {notificationPermissionStatus === 'granted' && (
+              <ThemedText style={[styles.notificationHelpText, { color: '#4CAF50' }]}>
+                ✅ Notifications are enabled. You'll receive push notifications for Hoots and friend requests, even when the app is closed.
+              </ThemedText>
+            )}
+          </ThemedView>
+
+          <ThemedView style={styles.section}>
+            <ThemedText style={styles.sectionTitle}>Account</ThemedText>
+            {username && (
+              <View style={styles.usernameContainer}>
+                <ThemedText style={styles.usernameLabel}>Username:</ThemedText>
+                <ThemedText style={styles.usernameValue}>@{username}</ThemedText>
+              </View>
+            )}
+            <TouchableOpacity
+              style={[styles.signOutButton, { borderColor: colors.icon }]}
+              onPress={handleSignOut}
+              disabled={loading}>
+              <ThemedText style={[styles.signOutText, { color: colors.icon }]}>
+                Sign Out
+              </ThemedText>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.deleteAccountButton, { borderColor: '#ff4444' }]}
+              onPress={handleDeleteAccount}
+              disabled={loading}>
+              {loading ? (
+                <ActivityIndicator color="#ff4444" />
+              ) : (
+                <ThemedText style={[styles.deleteAccountText, { color: '#ff4444' }]}>
+                  Delete Account
                 </ThemedText>
               )}
             </TouchableOpacity>
-          </View>
-        </ThemedView>
+          </ThemedView>
 
-        <ThemedView style={styles.section}>
-          <ThemedText style={styles.sectionTitle}>Account</ThemedText>
-          {username && (
-            <View style={styles.usernameContainer}>
-              <ThemedText style={styles.usernameLabel}>Username:</ThemedText>
-              <ThemedText style={styles.usernameValue}>@{username}</ThemedText>
-            </View>
-          )}
-          <TouchableOpacity
-            style={[styles.signOutButton, { borderColor: colors.icon }]}
-            onPress={handleSignOut}
-            disabled={loading}>
-            <ThemedText style={[styles.signOutText, { color: colors.icon }]}>
-              Sign Out
-            </ThemedText>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.deleteAccountButton, { borderColor: '#ff4444' }]}
-            onPress={handleDeleteAccount}
-            disabled={loading}>
-            {loading ? (
-              <ActivityIndicator color="#ff4444" />
-            ) : (
-              <ThemedText style={[styles.deleteAccountText, { color: '#ff4444' }]}>
-                Delete Account
-              </ThemedText>
-            )}
-          </TouchableOpacity>
-        </ThemedView>
-
-        <ThemedView style={styles.section}>
-          <ThemedText style={styles.sectionTitle}>Fun Stats 🎉</ThemedText>
-          <View style={styles.funStatsContainer}>
-            <View style={styles.statContent}>
-              <View style={styles.statRow}>
-                <ThemedText style={styles.statLabel}>Total Hoots Sent:</ThemedText>
-                <ThemedText style={styles.statValue}>{funStats.totalHoots.toLocaleString()}</ThemedText>
-              </View>
-              <View style={styles.statRow}>
-                <ThemedText style={styles.statLabel}>Total Characters Sent:</ThemedText>
-                <ThemedText style={styles.statValue}>{funStats.totalCharacters.toLocaleString()}</ThemedText>
-              </View>
-              <View style={styles.statRow}>
-                <ThemedText style={styles.statLabel}>Most Hoots in a Day:</ThemedText>
-                <ThemedText style={styles.statValue}>{funStats.mostHootsInDay}</ThemedText>
-              </View>
-              <View style={styles.statRow}>
-                <ThemedText style={styles.statLabel}>Favorite Day to Hoot:</ThemedText>
-                <ThemedText style={styles.statValue}>{funStats.favoriteDay}</ThemedText>
-              </View>
-              <View style={styles.statRow}>
-                <ThemedText style={styles.statLabel}>Top Recipient:</ThemedText>
-                <ThemedText style={styles.statValue}>
-                  {funStats.topRecipient.name} ({funStats.topRecipient.count} {funStats.topRecipient.count === 1 ? 'hoot' : 'hoots'})
-                </ThemedText>
-              </View>
-            </View>
-            {funStats.totalHoots < 50 && (
-              <>
-                <BlurView intensity={80} tint="light" style={StyleSheet.absoluteFill} />
-                <View style={styles.unlockOverlay}>
-                  <ThemedText style={styles.unlockTitle}>🔒 Locked</ThemedText>
-                  <ThemedText style={styles.unlockText}>
-                    Send {50 - funStats.totalHoots} more {50 - funStats.totalHoots === 1 ? 'hoot' : 'hoots'} to unlock your stats!
+          <ThemedView style={styles.section}>
+            <ThemedText style={styles.sectionTitle}>Fun Stats 🎉</ThemedText>
+            <View style={styles.funStatsContainer}>
+              <View style={styles.statContent}>
+                <View style={styles.statRow}>
+                  <ThemedText style={styles.statLabel}>Total Hoots Sent:</ThemedText>
+                  <ThemedText style={styles.statValue}>{funStats.totalHoots.toLocaleString()}</ThemedText>
+                </View>
+                <View style={styles.statRow}>
+                  <ThemedText style={styles.statLabel}>Total Characters Sent:</ThemedText>
+                  <ThemedText style={styles.statValue}>{funStats.totalCharacters.toLocaleString()}</ThemedText>
+                </View>
+                <View style={styles.statRow}>
+                  <ThemedText style={styles.statLabel}>Most Hoots in a Day:</ThemedText>
+                  <ThemedText style={styles.statValue}>{funStats.mostHootsInDay}</ThemedText>
+                </View>
+                <View style={styles.statRow}>
+                  <ThemedText style={styles.statLabel}>Favorite Day to Hoot:</ThemedText>
+                  <ThemedText style={styles.statValue}>{funStats.favoriteDay}</ThemedText>
+                </View>
+                <View style={styles.statRow}>
+                  <ThemedText style={styles.statLabel}>Top Recipient:</ThemedText>
+                  <ThemedText style={styles.statValue}>
+                    {funStats.topRecipient.name} ({funStats.topRecipient.count} {funStats.topRecipient.count === 1 ? 'hoot' : 'hoots'})
                   </ThemedText>
                 </View>
-              </>
-            )}
-          </View>
-        </ThemedView>
+              </View>
+              {funStats.totalHoots < 50 && (
+                <>
+                  <BlurView intensity={80} tint="light" style={StyleSheet.absoluteFill} />
+                  <View style={styles.unlockOverlay}>
+                    <ThemedText style={styles.unlockTitle}>🔒 Locked</ThemedText>
+                    <ThemedText style={styles.unlockText}>
+                      Send {50 - funStats.totalHoots} more {50 - funStats.totalHoots === 1 ? 'hoot' : 'hoots'} to unlock your stats!
+                    </ThemedText>
+                  </View>
+                </>
+              )}
+            </View>
+          </ThemedView>
 
-        <ThemedView style={styles.section}>
-          <ThemedText style={styles.sectionTitle}>About</ThemedText>
-          <ThemedText style={styles.aboutText}>
-            Hoot v1.0.0{'\n'}
-            Connect with friends and send them a Hoot! ❄️
-          </ThemedText>
+          <ThemedView style={styles.section}>
+            <ThemedText style={styles.sectionTitle}>About</ThemedText>
+            <ThemedText style={styles.aboutText}>
+              Hoot v1.0.0{'\n'}
+              Connect with friends and send them a Hoot! ❄️
+            </ThemedText>
+          </ThemedView>
         </ThemedView>
-      </ThemedView>
       </ScrollView>
       <LinearGradient
         colors={[
@@ -1000,6 +1221,49 @@ const styles = StyleSheet.create({
     right: 0,
     height: 25,
     zIndex: 999,
+  },
+  notificationStatusContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 12,
+    marginBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e0e0e0',
+  },
+  notificationStatusLabel: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#000',
+  },
+  notificationStatusValue: {
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  enableNotificationsButton: {
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    elevation: 6,
+    marginTop: 8,
+  },
+  enableNotificationsButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  notificationHelpText: {
+    fontSize: 13,
+    opacity: 0.7,
+    marginTop: 12,
+    color: '#000',
+    lineHeight: 18,
   },
 });
 

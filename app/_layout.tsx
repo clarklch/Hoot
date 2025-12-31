@@ -5,7 +5,7 @@ import { useEffect } from 'react';
 import 'react-native-reanimated';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { AuthProvider } from '@/contexts/AuthContext';
+import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { setupNotificationListeners } from '@/services/notifications';
 import { startMessageCleanup } from '@/services/messageCleanup';
 
@@ -15,10 +15,31 @@ export const unstable_settings = {
 
 function RootLayoutNav() {
   const router = useRouter();
+  const { user } = useAuth();
 
   useEffect(() => {
-    // Set up notification listeners
+    // Only set up notification listeners if user is authenticated
+    // This ensures notifications are only processed for the current user
+    if (!user?.uid) {
+      console.log('⚠️ Skipping notification listener setup: No authenticated user');
+      return;
+    }
+
+    const currentUserId = user.uid;
+    console.log('🔔 Setting up notification listeners for user:', currentUserId);
+
+    // Set up notification listeners with user validation
     const cleanup = setupNotificationListeners((messageId, message, fromUsername, fromUserId, fromDisplayName, groupId, groupName, isGroupMessage) => {
+      // CRITICAL: Verify this notification is FROM another user TO the current user
+      // Notifications should be FROM other users, not from the current user
+      if (!fromUserId || fromUserId === currentUserId) {
+        console.log('⚠️ Ignoring notification - invalid fromUserId or notification from self');
+        return;
+      }
+      
+      // This is a valid notification FROM another user TO the current user
+      console.log('✅ Processing notification from', fromUsername, 'to current user', currentUserId);
+
       // Use replace instead of push to prevent multiple instances
       router.replace({
         pathname: '/message-view',
@@ -38,13 +59,14 @@ function RootLayoutNav() {
     // Start message cleanup service
     startMessageCleanup();
 
-    // Cleanup listeners on unmount
+    // Cleanup listeners on unmount or when user changes
     return () => {
+      console.log('🧹 Cleaning up notification listeners');
       if (cleanup) {
         cleanup();
       }
     };
-  }, [router]);
+  }, [router, user?.uid]); // Re-setup when user changes
 
   return (
     <Stack>

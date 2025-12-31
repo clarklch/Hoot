@@ -8,6 +8,7 @@ import {
 } from 'firebase/auth';
 import { doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
 import * as AppleAuthentication from 'expo-apple-authentication';
+import * as Notifications from 'expo-notifications';
 import { auth, db } from '@/config/firebase';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { clearPushToken } from '@/services/notifications';
@@ -38,30 +39,65 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     // Firebase Auth automatically persists sessions on native platforms
     // onAuthStateChanged will restore the user session when app restarts
+    // This listener fires immediately with the current auth state when added
+    console.log('🔐 Setting up Firebase Auth state listener...');
+    
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      console.log('🔐 Auth state changed:', firebaseUser ? `User: ${firebaseUser.uid}` : 'No user');
+      
       if (firebaseUser) {
+        console.log('✅ Firebase Auth session restored for user:', firebaseUser.uid);
+        
         // Fetch user data from Firestore
-        const userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
-        const userData = userDoc.data();
-        
-        // If user document doesn't exist, create it with Apple account info
-        if (!userData) {
-          await setDoc(doc(db, 'users', firebaseUser.uid), {
+        try {
+          const userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
+          const userData = userDoc.data();
+          
+          // If user document doesn't exist, create it with Apple account info
+          if (!userData) {
+            await setDoc(doc(db, 'users', firebaseUser.uid), {
+              email: firebaseUser.email,
+              displayName: firebaseUser.displayName || null,
+              photoURL: firebaseUser.photoURL || null,
+            }, { merge: true });
+          }
+          
+          setUser({
+            uid: firebaseUser.uid,
             email: firebaseUser.email,
-            displayName: firebaseUser.displayName || null,
-            photoURL: firebaseUser.photoURL || null,
-          }, { merge: true });
+            displayName: userData?.displayName || firebaseUser.displayName,
+            username: userData?.username,
+            photoURL: firebaseUser.photoURL,
+          });
+          
+          console.log('✅ User state restored:', {
+            uid: firebaseUser.uid,
+            username: userData?.username || 'none',
+            displayName: userData?.displayName || firebaseUser.displayName || 'none',
+          });
+          
+          // Clear all pending notifications when user signs in
+          // This prevents old notifications from previous users from appearing
+          try {
+            await Notifications.dismissAllNotificationsAsync();
+            console.log('✅ Cleared all pending notifications on sign in');
+          } catch (notifError) {
+            console.log('Note: Could not clear notifications on sign in');
+          }
+        } catch (error) {
+          console.error('❌ Error restoring user data:', error);
+          // Still set user even if Firestore fetch fails
+          setUser({
+            uid: firebaseUser.uid,
+            email: firebaseUser.email,
+            displayName: firebaseUser.displayName,
+            username: undefined,
+            photoURL: firebaseUser.photoURL,
+          });
         }
-        
-        setUser({
-          uid: firebaseUser.uid,
-          email: firebaseUser.email,
-          displayName: userData?.displayName || firebaseUser.displayName,
-          username: userData?.username,
-          photoURL: firebaseUser.photoURL,
-        });
       } else {
         // User signed out - clear everything
+        console.log('ℹ️ No user signed in');
         setUser(null);
         
         // Clean up notification listeners
@@ -70,10 +106,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           notificationCleanupRef.current = null;
         }
       }
+      
+      // Only set loading to false after we've processed the auth state
       setLoading(false);
+      console.log('✅ Auth state loading complete');
     });
     
     return () => {
+      console.log('🧹 Cleaning up auth state listener');
       unsubscribe();
       // Clean up notification listeners on unmount
       if (notificationCleanupRef.current) {
@@ -118,9 +158,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       
       // Create OAuth provider for Apple
       const appleProvider = new OAuthProvider('apple.com');
+      
+      // For iOS native Sign in with Apple, we don't need a nonce
+      // The nonce is only required for web-based OAuth flows
       const firebaseCredential = appleProvider.credential({
         idToken: identityToken,
-        rawNonce: credential.nonce || undefined,
+        // Don't pass rawNonce for native iOS Sign in with Apple
       });
 
       console.log('🔥 Signing in with Firebase credential...');
@@ -138,18 +181,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
         const userData = userDoc.data();
         
+        // If user document doesn't exist, this is a new user (or account was deleted)
+        // They should be treated as a new user and prompted to create a username
+        const isNewUser = !userDoc.exists() || !userData;
+        
         // Prepare user data - use Apple's full name if available and not already set
         const displayName = credential.fullName 
           ? `${credential.fullName.givenName || ''} ${credential.fullName.familyName || ''}`.trim()
           : userData?.displayName || firebaseUser.displayName || null;
         
         // Update or create user document with Apple account info
+        // For new users (or deleted accounts), username will be null so they're prompted to create one
         await setDoc(doc(db, 'users', firebaseUser.uid), {
           email: firebaseUser.email || credential.email || userData?.email || null,
           displayName: displayName,
           photoURL: firebaseUser.photoURL || userData?.photoURL || null,
-          username: userData?.username || null, // Preserve existing username if any
+          username: userData?.username || null, // Will be null for new/deleted users - triggers username creation
         }, { merge: true });
+        
+        if (isNewUser) {
+          console.log('🆕 New user detected - will be prompted to create username');
+        }
         
         console.log('✅ User document updated in Firestore');
       }
@@ -187,6 +239,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         console.log('🧹 Cleaning up notification listeners');
         notificationCleanupRef.current();
         notificationCleanupRef.current = null;
+      }
+      
+      // Clear all pending notifications from device notification center
+      // This prevents old user's notifications from appearing
+      try {
+        await Notifications.dismissAllNotificationsAsync();
+        console.log('✅ Cleared all pending notifications');
+      } catch (notifError) {
+        console.log('Note: Could not clear notifications (expected in some environments)');
       }
       
       // Clear user state

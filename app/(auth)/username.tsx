@@ -204,14 +204,6 @@ export default function UsernameScreen() {
         style={styles.keyboardAvoidingView}
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}>
-        <TouchableOpacity 
-          style={[styles.backButton, { top: Math.max(insets.top, 40) + 10 }]}
-          onPress={() => {
-            router.replace('/(auth)/login');
-          }}>
-          <IconSymbol name="chevron.left" size={20} color="#000" />
-          <ThemedText style={styles.backButtonText}>Back</ThemedText>
-        </TouchableOpacity>
         <ScrollView 
           ref={scrollViewRef}
           contentContainerStyle={[styles.scrollContent, { paddingTop: Math.max(insets.top, 40) + 20, paddingBottom: insets.bottom + 100 }]}
@@ -456,28 +448,6 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '700',
     letterSpacing: 0.5,
-  },
-  backButton: {
-    position: 'absolute',
-    left: 20,
-    zIndex: 1000,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 20,
-    backgroundColor: 'rgba(255, 255, 255, 0.9)',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 4,
-  },
-  backButtonText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#000',
   },
 });
 

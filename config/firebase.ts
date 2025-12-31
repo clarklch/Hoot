@@ -4,8 +4,9 @@
 
 import * as Notifications from 'expo-notifications';
 import { initializeApp } from 'firebase/app';
-import { getAuth } from 'firebase/auth';
+import { getAuth, initializeAuth, getReactNativePersistence } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Firebase configuration object
 // You'll need to replace this with your actual Firebase config
@@ -27,8 +28,29 @@ const firebaseConfig = {
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 
+// Initialize Firebase Auth with React Native persistence
+// This ensures the auth state persists across app restarts
+let auth;
+try {
+  // Try to initialize with React Native persistence (for Expo/React Native)
+  auth = initializeAuth(app, {
+    persistence: getReactNativePersistence(AsyncStorage),
+  });
+  console.log('✅ Firebase Auth initialized with React Native persistence');
+} catch (error: any) {
+  // If auth is already initialized (e.g., hot reload), use getAuth instead
+  if (error.code === 'auth/already-initialized') {
+    auth = getAuth(app);
+    console.log('✅ Firebase Auth already initialized, using existing instance');
+  } else {
+    // Fallback to default getAuth
+    auth = getAuth(app);
+    console.log('✅ Firebase Auth initialized with default persistence');
+  }
+}
+
 // Initialize Firebase services
-export const auth = getAuth(app);
+export { auth };
 export const db = getFirestore(app);
 
 // Request notification permissions and get FCM token

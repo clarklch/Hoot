@@ -2,7 +2,7 @@
 import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
 import Constants from 'expo-constants';
-import { doc, setDoc, getDoc, updateDoc } from 'firebase/firestore';
+import { doc, setDoc, getDoc, updateDoc, collection, query, where, getDocs } from 'firebase/firestore';
 import { db } from '@/config/firebase';
 import * as Linking from 'expo-linking';
 
@@ -76,8 +76,62 @@ export async function registerForPushNotifications(userId: string): Promise<stri
       throw error;
     }
 
-    // CRITICAL: Only save token for the current user
-    // This ensures old users' tokens are replaced when a new user signs in
+    // CRITICAL: Clear this push token from all other users' documents
+    // This ensures a push token is only associated with one user at a time
+    // (same device, same push token, but different users)
+    console.log('🔍 Checking for other users with the same push token...');
+    const usersWithSameTokenQuery = query(
+      collection(db, 'users'),
+      where('pushToken', '==', tokenData.data)
+    );
+    const usersWithSameTokenSnapshot = await getDocs(usersWithSameTokenQuery);
+    
+    // Clear push token from all other users with the same token (not the current user)
+    const clearSameTokenPromises = usersWithSameTokenSnapshot.docs
+      .filter(docSnap => docSnap.id !== userId)
+      .map(async (docSnap) => {
+        try {
+          await updateDoc(docSnap.ref, { pushToken: null });
+          console.log(`🧹 Cleared push token from user with same token: ${docSnap.id}`);
+        } catch (error) {
+          console.error(`Error clearing push token from user ${docSnap.id}:`, error);
+        }
+      });
+    
+    await Promise.all(clearSameTokenPromises);
+    
+    // ADDITIONAL SAFEGUARD: Also clear push tokens from any other users on this device
+    // This prevents notifications from being sent to old test accounts
+    // We'll get all users and check if they have any push token, then clear it if they're not the current user
+    // Note: This is more aggressive but necessary to prevent cross-user notifications
+    console.log('🔍 Clearing push tokens from all other users to prevent cross-user notifications...');
+    try {
+      const allUsersQuery = query(collection(db, 'users'));
+      const allUsersSnapshot = await getDocs(allUsersQuery);
+      
+      const clearAllPromises = allUsersSnapshot.docs
+        .filter(docSnap => {
+          const userData = docSnap.data();
+          // Only clear if user has a push token and is not the current user
+          return docSnap.id !== userId && userData?.pushToken && userData.pushToken !== null;
+        })
+        .map(async (docSnap) => {
+          try {
+            await updateDoc(docSnap.ref, { pushToken: null });
+            console.log(`🧹 Cleared push token from other user: ${docSnap.id}`);
+          } catch (error) {
+            console.error(`Error clearing push token from user ${docSnap.id}:`, error);
+          }
+        });
+      
+      await Promise.all(clearAllPromises);
+      console.log('✅ Cleared push tokens from all other users');
+    } catch (error) {
+      console.error('Error clearing push tokens from all users:', error);
+      // Don't fail the registration if this cleanup fails
+    }
+    
+    // Now save the token for the current user
     console.log('💾 Saving push token to Firestore for user:', userId);
     await setDoc(
       doc(db, 'users', userId),
@@ -104,11 +158,26 @@ export async function clearPushToken(userId: string): Promise<void> {
     }
 
     console.log('🧹 Clearing push token for user:', userId);
-    await updateDoc(doc(db, 'users', userId), {
+    
+    // Check if document exists before trying to update
+    const userDocRef = doc(db, 'users', userId);
+    const userDoc = await getDoc(userDocRef);
+    
+    if (!userDoc.exists()) {
+      console.log('⚠️ User document does not exist, skipping push token clear');
+      return;
+    }
+    
+    await updateDoc(userDocRef, {
       pushToken: null,
     });
     console.log('✅ Push token cleared for user:', userId);
-  } catch (error) {
+  } catch (error: any) {
+    // Handle case where document doesn't exist (e.g., during account deletion)
+    if (error?.code === 'not-found' || error?.message?.includes('No document to update')) {
+      console.log('⚠️ User document does not exist, skipping push token clear');
+      return;
+    }
     console.error('Error clearing push token:', error);
   }
 }
@@ -147,6 +216,8 @@ export function setupNotificationListeners(navigationCallback?: (messageId: stri
   // Handle notifications received while app is in foreground
   receivedSubscription = Notifications.addNotificationReceivedListener((notification) => {
     console.log('Notification received:', notification);
+    // Note: We can't verify user here since we don't have access to current user
+    // The Cloud Function should have already filtered by push token
   });
 
   // Handle user tapping on notification

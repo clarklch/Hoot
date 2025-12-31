@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useFocusEffect, useLocalSearchParams } from 'expo-router';
 import React from 'react';
-import { View, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert, ActivityIndicator, Image, PanResponder, Dimensions, LayoutAnimation, Platform, UIManager, Modal } from 'react-native';
+import { View, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert, ActivityIndicator, Image, PanResponder, Dimensions, LayoutAnimation, Platform, Modal } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { ThemedText } from '@/components/themed-text';
@@ -78,10 +78,7 @@ export default function FriendsScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
 
-  // Enable smooth layout animations (especially on Android)
-  if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
-    UIManager.setLayoutAnimationEnabledExperimental(true);
-  }
+  // iOS-only: Layout animations work smoothly by default
   // Set initial tab based on route params (e.g., ?tab=groups)
   useEffect(() => {
     if (params?.tab === 'groups') {
@@ -235,6 +232,44 @@ export default function FriendsScreen() {
   // ========================================================================
   // DATA REFRESH ON FOCUS
   // ========================================================================
+  // Set up real-time listeners for friend requests
+  useEffect(() => {
+    const currentUserId = user?.uid;
+    if (!currentUserId) return;
+
+    // Set up listener for incoming requests (where current user is the friendId)
+    const incomingQuery = query(
+      collection(db, 'friendships'),
+      where('friendId', '==', currentUserId),
+      where('status', '==', 'pending')
+    );
+    const incomingUnsubscribe = onSnapshot(incomingQuery, (snapshot) => {
+      // Reload requests when incoming requests change
+      loadRequests();
+    }, (error) => {
+      console.error('Error listening to incoming requests:', error);
+    });
+
+    // Set up listener for outgoing requests (where current user is the userId)
+    const outgoingQuery = query(
+      collection(db, 'friendships'),
+      where('userId', '==', currentUserId),
+      where('status', '==', 'pending')
+    );
+    const outgoingUnsubscribe = onSnapshot(outgoingQuery, (snapshot) => {
+      // Reload requests when outgoing requests change
+      loadRequests();
+    }, (error) => {
+      console.error('Error listening to outgoing requests:', error);
+    });
+
+    // Cleanup listeners on unmount
+    return () => {
+      incomingUnsubscribe();
+      outgoingUnsubscribe();
+    };
+  }, [user?.uid]);
+
   // Refresh data when screen comes into focus
   useFocusEffect(
     React.useCallback(() => {
@@ -740,6 +775,22 @@ export default function FriendsScreen() {
     } catch (error) {
       console.error('Error declining request:', error);
       Alert.alert('Error', 'Failed to decline friend request');
+    }
+  };
+
+  const handleCancelRequest = async (requestId: string, friendId: string) => {
+    try {
+      // Get the friend's display name for the alert
+      const friendDoc = await getDoc(doc(db, 'users', friendId));
+      const friendData = friendDoc.data();
+      const friendName = friendData?.displayName || friendData?.username || 'user';
+
+      await deleteDoc(doc(db, 'friendships', requestId));
+      Alert.alert('Success', `Friend request to ${friendName} cancelled`);
+      loadRequests();
+    } catch (error) {
+      console.error('Error cancelling request:', error);
+      Alert.alert('Error', 'Failed to cancel friend request');
     }
   };
 
@@ -1684,7 +1735,7 @@ export default function FriendsScreen() {
                       </ThemedText>
                     )}
                   </View>
-                  {request.isIncoming && (
+                  {request.isIncoming ? (
                     <View style={styles.requestActions}>
                       <TouchableOpacity
                         style={[styles.acceptButton, { backgroundColor: colors.tint }]}
@@ -1695,6 +1746,14 @@ export default function FriendsScreen() {
                         style={[styles.declineButton, { backgroundColor: '#ff4444' }]}
                         onPress={() => handleDeclineRequest(request.id)}>
                         <ThemedText style={styles.declineButtonText}>Decline</ThemedText>
+                      </TouchableOpacity>
+                    </View>
+                  ) : (
+                    <View style={styles.requestActions}>
+                      <TouchableOpacity
+                        style={[styles.cancelButton, { backgroundColor: '#ff9500' }]}
+                        onPress={() => handleCancelRequest(request.id, request.friendId)}>
+                        <ThemedText style={styles.cancelButtonText}>Cancel</ThemedText>
                       </TouchableOpacity>
                     </View>
                   )}
@@ -2695,6 +2754,22 @@ const styles = StyleSheet.create({
     elevation: 6,
   },
   declineButtonText: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 15,
+  },
+  cancelButton: {
+    flex: 1,
+    padding: 14,
+    borderRadius: 18,
+    alignItems: 'center',
+    shadowColor: '#ff9500',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  cancelButtonText: {
     color: '#fff',
     fontWeight: '700',
     fontSize: 15,

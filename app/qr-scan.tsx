@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { View, StyleSheet, TouchableOpacity, Alert, ActivityIndicator } from 'react-native';
 import { CameraView, useCameraPermissions, BarcodeScanningResult } from 'expo-camera';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -21,6 +21,8 @@ export default function QRScanScreen() {
   const [alertShown, setAlertShown] = useState(false);
   const [requestInProgress, setRequestInProgress] = useState<string | null>(null);
   const [cameraReady, setCameraReady] = useState(false);
+  const processingRef = useRef(false); // Use ref for immediate duplicate prevention
+  const lastScannedDataRef = useRef<string | null>(null); // Track last scanned QR data
   const { user } = useAuth();
   const router = useRouter();
   const colorScheme = useColorScheme();
@@ -50,13 +52,13 @@ export default function QRScanScreen() {
         // Permission state not loaded yet, wait a bit
         return;
       }
-      
+
       if (permission.granted) {
         // Permission is granted, camera is ready
         setCameraReady(true);
         return;
       }
-      
+
       if (!permission.granted && permission.canAskAgain) {
         // Request permission
         try {
@@ -95,9 +97,20 @@ export default function QRScanScreen() {
 
   const handleBarCodeScanned = async (result: BarcodeScanningResult) => {
     const data = result.data;
-    // Prevent multiple scans and duplicate alerts
-    if (scanned || loading || alertShown || requestInProgress) return;
 
+    // CRITICAL: Prevent multiple scans using ref (immediate, no state delay)
+    if (processingRef.current || scanned || loading || alertShown) {
+      return;
+    }
+
+    // Prevent scanning the same QR code data multiple times
+    if (lastScannedDataRef.current === data) {
+      return;
+    }
+
+    // Mark as processing immediately (before any async operations)
+    processingRef.current = true;
+    lastScannedDataRef.current = data;
     setScanned(true);
     setLoading(true);
 
@@ -107,6 +120,7 @@ export default function QRScanScreen() {
       try {
         qrData = JSON.parse(data);
       } catch (parseError) {
+        processingRef.current = false;
         if (!alertShown) {
           setAlertShown(true);
           Alert.alert('Invalid QR Code', 'This QR code format is not recognized', [
@@ -116,6 +130,8 @@ export default function QRScanScreen() {
                 setAlertShown(false);
                 setScanned(false);
                 setLoading(false);
+                processingRef.current = false;
+                lastScannedDataRef.current = null;
               },
             },
           ]);
@@ -124,6 +140,7 @@ export default function QRScanScreen() {
       }
 
       if (qrData.type !== 'hoot_friend_request') {
+        processingRef.current = false;
         if (!alertShown) {
           setAlertShown(true);
           Alert.alert('Invalid QR Code', 'This QR code is not a Hoot friend request', [
@@ -133,6 +150,8 @@ export default function QRScanScreen() {
                 setAlertShown(false);
                 setScanned(false);
                 setLoading(false);
+                processingRef.current = false;
+                lastScannedDataRef.current = null;
               },
             },
           ]);
@@ -141,8 +160,9 @@ export default function QRScanScreen() {
       }
 
       const targetUserId = qrData.userId;
-      
+
       if (!targetUserId) {
+        processingRef.current = false;
         if (!alertShown) {
           setAlertShown(true);
           Alert.alert('Invalid QR Code', 'This QR code does not contain user information', [
@@ -152,29 +172,34 @@ export default function QRScanScreen() {
                 setAlertShown(false);
                 setScanned(false);
                 setLoading(false);
+                processingRef.current = false;
+                lastScannedDataRef.current = null;
               },
             },
           ]);
         }
         return;
       }
-      
+
       // Get actual user ID
       const userId = await getCurrentUserId(user);
-      
+
       // Create a unique key for this request to prevent duplicates
       const requestKey = `${userId}_${targetUserId}`;
-      
+
       // Check if this exact request is already in progress
       if (requestInProgress === requestKey) {
+        processingRef.current = false;
         setScanned(false);
         setLoading(false);
+        lastScannedDataRef.current = null;
         return;
       }
-      
+
       setRequestInProgress(requestKey);
 
       if (targetUserId === userId) {
+        processingRef.current = false;
         if (!alertShown) {
           setAlertShown(true);
           Alert.alert('Error', 'You cannot send a friend request to yourself', [
@@ -184,6 +209,8 @@ export default function QRScanScreen() {
                 setAlertShown(false);
                 setScanned(false);
                 setLoading(false);
+                processingRef.current = false;
+                lastScannedDataRef.current = null;
               },
             },
           ]);
@@ -191,7 +218,8 @@ export default function QRScanScreen() {
         return;
       }
 
-      // Check if friendship already exists in either direction (pending or accepted)
+      // CRITICAL: Check if friendship already exists BEFORE creating new one
+      // This prevents race conditions where multiple scans happen simultaneously
       const existingQuery1 = query(
         collection(db, 'friendships'),
         where('userId', '==', userId),
@@ -202,7 +230,7 @@ export default function QRScanScreen() {
         where('userId', '==', targetUserId),
         where('friendId', '==', userId)
       );
-      
+
       const [snapshot1, snapshot2] = await Promise.all([
         getDocs(existingQuery1),
         getDocs(existingQuery2)
@@ -213,7 +241,8 @@ export default function QRScanScreen() {
         const allDocs = [...snapshot1.docs, ...snapshot2.docs];
         const hasAccepted = allDocs.some(doc => doc.data().status === 'accepted');
         const hasPending = allDocs.some(doc => doc.data().status === 'pending');
-        
+
+        processingRef.current = false;
         if (!alertShown) {
           setAlertShown(true);
           if (hasAccepted) {
@@ -224,6 +253,8 @@ export default function QRScanScreen() {
                   setAlertShown(false);
                   setScanned(false);
                   setLoading(false);
+                  processingRef.current = false;
+                  lastScannedDataRef.current = null;
                 },
               },
             ]);
@@ -235,6 +266,8 @@ export default function QRScanScreen() {
                   setAlertShown(false);
                   setScanned(false);
                   setLoading(false);
+                  processingRef.current = false;
+                  lastScannedDataRef.current = null;
                 },
               },
             ]);
@@ -243,7 +276,48 @@ export default function QRScanScreen() {
         return;
       }
 
-      // Create friend request
+      // CRITICAL: Double-check before creating (prevent race condition)
+      // Re-query to ensure no request was created between our check and now
+      const finalCheck1 = query(
+        collection(db, 'friendships'),
+        where('userId', '==', userId),
+        where('friendId', '==', targetUserId),
+        where('status', '==', 'pending')
+      );
+      const finalCheck2 = query(
+        collection(db, 'friendships'),
+        where('userId', '==', targetUserId),
+        where('friendId', '==', userId),
+        where('status', '==', 'pending')
+      );
+
+      const [finalSnapshot1, finalSnapshot2] = await Promise.all([
+        getDocs(finalCheck1),
+        getDocs(finalCheck2)
+      ]);
+
+      if (!finalSnapshot1.empty || !finalSnapshot2.empty) {
+        // A request was just created (race condition caught)
+        processingRef.current = false;
+        if (!alertShown) {
+          setAlertShown(true);
+          Alert.alert('Request Already Sent', 'A friend request to this user was just sent', [
+            {
+              text: 'OK',
+              onPress: () => {
+                setAlertShown(false);
+                setScanned(false);
+                setLoading(false);
+                processingRef.current = false;
+                lastScannedDataRef.current = null;
+              },
+            },
+          ]);
+        }
+        return;
+      }
+
+      // Create friend request (only one will be created due to checks above)
       await addDoc(collection(db, 'friendships'), {
         userId: userId,
         friendId: targetUserId,
@@ -259,6 +333,8 @@ export default function QRScanScreen() {
             onPress: () => {
               setAlertShown(false);
               setRequestInProgress(null);
+              processingRef.current = false;
+              // Keep lastScannedDataRef to prevent re-scanning same QR
               goBack();
             },
           },
@@ -266,6 +342,7 @@ export default function QRScanScreen() {
       }
     } catch (error) {
       console.error('Error processing QR code:', error);
+      processingRef.current = false;
       if (!alertShown) {
         setAlertShown(true);
         Alert.alert('Error', 'Failed to process QR code. Please try again.', [
@@ -275,6 +352,8 @@ export default function QRScanScreen() {
               setAlertShown(false);
               setScanned(false);
               setRequestInProgress(null);
+              processingRef.current = false;
+              lastScannedDataRef.current = null;
             },
           },
         ]);
@@ -305,7 +384,7 @@ export default function QRScanScreen() {
     return (
       <ThemedView style={[styles.container, { backgroundColor: colors.background }]}>
         {/* Floating back button */}
-        <TouchableOpacity 
+        <TouchableOpacity
           style={[styles.floatingBackButton, { top: insets.top + 10 }]}
           onPress={goBack}>
           <View style={styles.backButtonContent}>
@@ -362,14 +441,14 @@ export default function QRScanScreen() {
       <CameraView
         style={styles.camera}
         facing="back"
-        onBarcodeScanned={scanned ? undefined : handleBarCodeScanned}
+        onBarcodeScanned={(scanned || loading || processingRef.current) ? undefined : handleBarCodeScanned}
         barcodeScannerSettings={{
           barcodeTypes: ['qr'],
         }}
       />
-      
+
       {/* Floating back button */}
-      <TouchableOpacity 
+      <TouchableOpacity
         style={[styles.floatingBackButton, { top: insets.top + 10 }]}
         onPress={goBack}>
         <View style={styles.backButtonContent}>
@@ -384,7 +463,7 @@ export default function QRScanScreen() {
           <ThemedText style={styles.loadingText}>Processing...</ThemedText>
         </View>
       )}
-      
+
       {!loading && (
         <View style={styles.overlay}>
           <View style={styles.scanArea} />

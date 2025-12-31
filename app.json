@@ -2,7 +2,7 @@
   "expo": {
     "name": "Hoot",
     "slug": "hoot",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "hoot",
@@ -17,9 +17,15 @@
         "NSPhotoLibraryUsageDescription": "We need access to your photos to share images.",
         "ITSAppUsesNonExemptEncryption": false,
         "UIBackgroundModes": [
+          "remote-notification",
           "remote-notification"
         ],
         "CFBundleURLTypes": [
+          {
+            "CFBundleURLSchemes": [
+              "hoot"
+            ]
+          },
           {
             "CFBundleURLSchemes": [
               "hoot"
@@ -74,6 +80,19 @@
       "eas": {
         "projectId": "2901f7b5-e5f2-4774-bfca-970cf49a4d6f"
       }
+    },
+    "android": {
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ],
+      "package": "com.sendahoot.app"
+    },
+    "runtimeVersion": "1.0.0",
+    "updates": {
+      "url": "https://u.expo.dev/2901f7b5-e5f2-4774-bfca-970cf49a4d6f"
     }
   }
 }
