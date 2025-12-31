@@ -192,18 +192,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         
         // Update or create user document with Apple account info
         // For new users (or deleted accounts), username will be null so they're prompted to create one
+        const finalUsername = userData?.username || null;
         await setDoc(doc(db, 'users', firebaseUser.uid), {
           email: firebaseUser.email || credential.email || userData?.email || null,
           displayName: displayName,
           photoURL: firebaseUser.photoURL || userData?.photoURL || null,
-          username: userData?.username || null, // Will be null for new/deleted users - triggers username creation
+          username: finalUsername, // Will be null for new/deleted users - triggers username creation
         }, { merge: true });
+        
+        // CRITICAL: Immediately update local user state so navigation can happen
+        // This ensures the login screen can navigate to username screen right away
+        setUser({
+          uid: firebaseUser.uid,
+          email: firebaseUser.email || credential.email || null,
+          displayName: displayName,
+          username: finalUsername,
+          photoURL: firebaseUser.photoURL || null,
+        });
         
         if (isNewUser) {
           console.log('🆕 New user detected - will be prompted to create username');
         }
         
-        console.log('✅ User document updated in Firestore');
+        console.log('✅ User document updated in Firestore and local state updated');
       }
     } catch (error: any) {
       console.error('❌ Sign in error:', error);
