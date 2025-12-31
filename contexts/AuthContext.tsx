@@ -48,12 +48,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       console.log('🔐 Auth state changed:', firebaseUser ? `User: ${firebaseUser.uid}` : 'No user');
       
       if (firebaseUser) {
-        // If we just signed in, skip updating state to avoid race condition with navigation
-        // The signIn() function already set the user state correctly
-        if (justSignedInRef.current === firebaseUser.uid) {
-          console.log('⏭️ Skipping onAuthStateChanged update - user state already set by signIn()');
-          setLoading(false);
-          return;
+        const isJustSignedIn = justSignedInRef.current === firebaseUser.uid;
+        
+        if (isJustSignedIn) {
+          console.log('⏭️ onAuthStateChanged: signIn() is handling state update, but ensuring state is set as fallback');
         }
         
         console.log('✅ Firebase Auth session detected for user:', firebaseUser.uid);
@@ -92,8 +90,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             hasEmail: !!userState.email,
             hasDisplayName: !!userState.displayName,
             hasUsername: !!userState.username,
+            isJustSignedIn: isJustSignedIn,
           });
           
+          // Always set user state - even if signIn() is handling it, this ensures it's set
+          // React will handle deduplication if the state is the same
           setUser(userState);
           
           console.log('✅ User state restored:', {
@@ -228,19 +229,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       
       // Sign in to Firebase with Apple credential
       let userCredential;
+      let firebaseUser;
       try {
         userCredential = await signInWithCredential(auth, firebaseCredential);
         console.log('✅ Firebase sign-in successful!');
         
-        // IMMEDIATELY set the ref after signInWithCredential completes but before onAuthStateChanged processes
-        // onAuthStateChanged fires asynchronously, so we have a small window
-        const firebaseUser = userCredential.user;
+        firebaseUser = userCredential.user;
+        // Set ref IMMEDIATELY after signInWithCredential - onAuthStateChanged fires synchronously
         if (firebaseUser) {
           justSignedInRef.current = firebaseUser.uid;
-          // Clear the flag after navigation has time to happen
-          setTimeout(() => {
-            justSignedInRef.current = null;
-          }, 1000); // Increased to 1000ms to be safer
+          console.log('🔒 Set justSignedInRef to prevent onAuthStateChanged race condition');
         }
       } catch (firebaseError: any) {
         console.error('❌ Firebase sign-in failed:', firebaseError);
@@ -259,15 +257,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         throw new Error(`Firebase sign-in failed: ${firebaseError.message || firebaseError.code || 'Unknown error'}`);
       }
       
-      const firebaseUser = userCredential.user;
       if (!firebaseUser) {
         console.error('❌ No user returned from Firebase sign-in');
         throw new Error('No user returned from Firebase sign-in');
       }
       
-      // Ensure ref is set (in case it wasn't set in the try block)
+      // Ensure ref is set (should already be set, but double-check)
       if (!justSignedInRef.current) {
         justSignedInRef.current = firebaseUser.uid;
+        console.log('🔒 Set justSignedInRef as fallback');
       }
       
       console.log('👤 User signed in:', {
@@ -350,6 +348,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // The onAuthStateChanged listener will also fire, but we've set justSignedInRef
       // to prevent it from overwriting our state during navigation
       setUser(userState);
+      
+      // Clear loading state to allow navigation
+      setLoading(false);
+      
+      // Clear the ref after a delay to allow onAuthStateChanged to work normally for future auth changes
+      setTimeout(() => {
+        justSignedInRef.current = null;
+      }, 2000);
       
       if (isNewUser) {
         console.log('🆕 New user detected - will be prompted to create username');
