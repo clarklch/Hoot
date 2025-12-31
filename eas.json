@@ -24,7 +24,8 @@
       },
       "env": {
         "NPM_CONFIG_PACKAGE_LOCK_ONLY": "true"
-      }
+      },
+      "node": "22.x.x"
     }
   },
   "submit": {
