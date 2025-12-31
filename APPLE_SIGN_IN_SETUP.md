@@ -95,19 +95,86 @@ Sign in with Apple works best on physical devices. Test the flow:
 
 ## Troubleshooting
 
+### ⚠️ MOST COMMON ISSUE: "Authentication not working" or "No user in Firebase"
+
+**If you sign in with Apple but don't see the user in Firebase or don't get redirected:**
+
+1. **Check Firebase Console - Apple Sign-In MUST be enabled:**
+   - Go to [Firebase Console](https://console.firebase.google.com/)
+   - Select your project: **hoot-7fe85**
+   - Click **Authentication** in the left menu
+   - Click **Sign-in method** tab
+   - Look for **Apple** in the list
+   - If Apple is NOT listed or is disabled:
+     - Click **Add new provider** → **Apple**
+     - Toggle **Enable** to ON
+     - Click **Save**
+   - **This is the #1 cause of authentication failures!**
+
+2. **Check the console logs:**
+   - When you sign in, check your terminal/console for error messages
+   - Look for errors like:
+     - `auth/operation-not-allowed` → Apple Sign-In not enabled in Firebase
+     - `auth/invalid-credential` → Token issue, try signing in again
+     - `No identity token received` → Apple authentication issue
+
+3. **Verify Apple Developer Portal:**
+   - Go to [Apple Developer Portal](https://developer.apple.com/account/)
+   - Navigate to **Certificates, Identifiers & Profiles**
+   - Click **Identifiers** → Find your app (`com.sendahoot.app`)
+   - Make sure **Sign In with Apple** is checked/enabled
+
 ### "Sign in with Apple is not available"
 - Make sure you're on iOS 13+
 - Make sure you enabled it in Apple Developer Portal
 - Make sure you're using a development build (not Expo Go)
+- Check that `usesAppleSignIn: true` is in `app.json`
 
 ### "No identity token received"
-- Check that Sign in with Apple is enabled in Firebase Console
+- Check that Sign in with Apple is enabled in Firebase Console (see above)
 - Verify your Apple Developer account setup
+- Try signing in again (sometimes first attempt fails)
+
+### "Firebase sign-in failed: auth/operation-not-allowed"
+- **This means Apple Sign-In is not enabled in Firebase Console**
+- Go to Firebase Console → Authentication → Sign-in method
+- Enable Apple provider (see step 1 above)
 
 ### Button doesn't appear
 - The app checks if Apple Authentication is available
 - If not available, it shows a fallback "Continue" button
 - Make sure you're on iOS 13+ and have a development build
+- Make sure `expo-apple-authentication` plugin is in `app.json`
+
+### "User not redirected to username screen"
+- Check console logs for errors during sign-in
+- Verify user state is being set (check logs for "Setting user state")
+- Make sure Firestore is enabled and accessible
+- Check that navigation logic is working (see logs for "Navigating to username creation")
+
+### Debugging Steps
+
+1. **Enable detailed logging:**
+   - The app now has comprehensive logging
+   - Check your terminal/console when signing in
+   - Look for these key messages:
+     - `🍎 Starting Sign in with Apple...`
+     - `✅ Apple authentication successful`
+     - `🔑 Creating Firebase credential...`
+     - `🔥 Signing in with Firebase credential...`
+     - `✅ Firebase sign-in successful!`
+     - `👤 Setting user state...`
+
+2. **Check Firebase Authentication:**
+   - Go to Firebase Console → Authentication → Users
+   - After signing in, you should see a user appear here
+   - If no user appears, Firebase authentication failed
+
+3. **Check Firestore:**
+   - Go to Firebase Console → Firestore Database
+   - After signing in, check the `users` collection
+   - You should see a document with your user ID
+   - If no document appears, Firestore write failed (but auth might still work)
 
 ## Notes
 

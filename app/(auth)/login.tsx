@@ -121,38 +121,58 @@ export default function LoginScreen() {
 
   useEffect(() => {
     if (user) {
+      console.log('🔐 Login screen: User detected, checking username...', {
+        uid: user.uid,
+        hasUsername: !!user.username,
+      });
       setIsSigningIn(false);
       // After Apple Sign-In, check if user has username
       if (!user.username) {
         // User signed in but doesn't have username - go to username creation
+        console.log('➡️ Navigating to username creation screen');
         router.replace('/(auth)/username');
       } else {
         // User has username - go to main app
+        console.log('➡️ Navigating to main app (user has username)');
         router.replace('/(tabs)');
       }
+    } else if (!loading) {
+      // User is not signed in and loading is complete
+      console.log('ℹ️ Login screen: No user, staying on login screen');
     }
-  }, [user, router]);
+  }, [user, loading, router]);
 
   const handleSignIn = async () => {
     try {
+      console.log('🔐 Login screen: Starting sign-in process...');
       await signIn();
-    } catch (error) {
-      console.error('Sign in failed:', error);
-      // You can add error handling UI here
+      console.log('✅ Login screen: Sign-in process completed');
+    } catch (error: any) {
+      console.error('❌ Login screen: Sign in failed:', error);
+      setIsSigningIn(false);
+      // Error handling is done in signIn function, but we log it here too
     }
   };
 
   const handleContinue = async () => {
     // Trigger Sign in with Apple when Continue is clicked
     try {
+      console.log('🔐 Login screen: User clicked Continue, starting sign-in...');
       setIsSigningIn(true);
       await signIn();
+      console.log('✅ Login screen: Sign-in completed successfully');
+      // Note: setIsSigningIn(false) is handled in the useEffect when user state changes
     } catch (error: any) {
-      console.error('Sign in failed:', error);
+      console.error('❌ Login screen: Sign in failed:', error);
       setIsSigningIn(false);
       // Don't show error for user cancellation
       if (error.code !== 'ERR_REQUEST_CANCELED') {
+        console.error('   Error code:', error.code);
+        console.error('   Error message:', error.message);
         // You can add error handling UI here if needed
+        // For now, the error is logged and the user can try again
+      } else {
+        console.log('ℹ️ User cancelled sign-in');
       }
     }
   };
