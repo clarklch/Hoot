@@ -17,6 +17,38 @@ const expo = new Expo();
 // Set global options for all functions
 setGlobalOptions({maxInstances: 10});
 
+// Helper function to retry with exponential backoff
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  initialDelay: number = 1000
+): Promise<T> {
+  let lastError: Error;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      lastError = error;
+      
+      // Don't retry on certain errors (e.g., invalid token)
+      if (error?.message?.includes("InvalidCredentials") || 
+          error?.message?.includes("DeviceNotRegistered") ||
+          error?.message?.includes("invalid")) {
+        throw error;
+      }
+      
+      if (attempt < maxRetries - 1) {
+        const delay = initialDelay * Math.pow(2, attempt);
+        logger.info(`Retry attempt ${attempt + 1}/${maxRetries} after ${delay}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  
+  throw lastError!;
+}
+
 // Send Hoot notifications when a notification document is created
 export const sendHootNotification = onDocumentCreated(
   "notifications/{notificationId}",
@@ -28,43 +60,40 @@ export const sendHootNotification = onDocumentCreated(
       return;
     }
     
-    const pushToken = notification.pushToken;
     const messageId = notification.messageId;
     const fromUserId = notification.fromUserId;
     const toUserId = notification.toUserId;
     
-    if (!pushToken || !Expo.isExpoPushToken(pushToken)) {
-      logger.warn("Invalid push token or not an Expo token:", pushToken);
+    if (!toUserId) {
+      logger.warn("No toUserId in notification, skipping");
       return;
     }
     
-    // CRITICAL: Verify the push token is still valid for this user
-    // This prevents sending notifications to users who have signed out
-    if (toUserId) {
-      try {
-        const recipientDoc = await admin.firestore()
-          .collection("users")
-          .doc(toUserId)
-          .get();
-        
-        if (!recipientDoc.exists) {
-          logger.warn(`Recipient user ${toUserId} does not exist, skipping notification`);
-          return;
-        }
-        
-        const recipientData = recipientDoc.data();
-        const currentPushToken = recipientData?.pushToken;
-        
-        // If the push token in the notification doesn't match the current push token,
-        // the user has likely signed out or changed devices - don't send
-        if (currentPushToken !== pushToken) {
-          logger.info(`Push token mismatch for user ${toUserId}. User may have signed out. Skipping notification.`);
-          return;
-        }
-      } catch (error) {
-        logger.warn("Error verifying push token:", error);
-        // Fail open - continue with sending if verification fails
+    // CRITICAL: Always fetch push token fresh from user document
+    // This ensures we get the most up-to-date token, even if it was null when notification was created
+    // This is the key to guaranteeing notifications - we don't rely on stale client-provided tokens
+    let pushToken: string | null = null;
+    try {
+      const recipientDoc = await admin.firestore()
+        .collection("users")
+        .doc(toUserId)
+        .get();
+      
+      if (!recipientDoc.exists) {
+        logger.warn(`Recipient user ${toUserId} does not exist, skipping notification`);
+        return;
       }
+      
+      const recipientData = recipientDoc.data();
+      pushToken = recipientData?.pushToken || null;
+      
+      if (!pushToken || !Expo.isExpoPushToken(pushToken)) {
+        logger.info(`No valid push token for user ${toUserId}. User may not have registered for notifications yet.`);
+        return;
+      }
+    } catch (error) {
+      logger.error(`Error fetching push token for user ${toUserId}:`, error);
+      return;
     }
     
     // Check if recipient has muted the sender
@@ -98,6 +127,38 @@ export const sendHootNotification = onDocumentCreated(
         }
       } catch (error) {
         logger.warn("Error checking mute status in Cloud Function:", error);
+        // Continue with sending notification if mute check fails (fail open)
+      }
+    }
+    
+    // Check for group mutes (if this is a group message)
+    if (notification.isGroupMessage && notification.groupId && toUserId) {
+      try {
+        const groupMuteQuery = admin.firestore()
+          .collection("groupMutes")
+          .where("userId", "==", toUserId)
+          .where("groupId", "==", notification.groupId)
+          .limit(1);
+        
+        const groupMuteSnapshot = await groupMuteQuery.get();
+        
+        if (!groupMuteSnapshot.empty) {
+          const groupMuteData = groupMuteSnapshot.docs[0].data();
+          const mutedUntil = groupMuteData.mutedUntil;
+          
+          if (mutedUntil) {
+            const mutedUntilDate = mutedUntil.toDate ? mutedUntil.toDate() : new Date(mutedUntil);
+            const now = new Date();
+            
+            // If mute hasn't expired, don't send notification
+            if (mutedUntilDate > now) {
+              logger.info(`Skipping notification: Recipient ${toUserId} has muted group ${notification.groupId} until ${mutedUntilDate}`);
+              return;
+            }
+          }
+        }
+      } catch (error) {
+        logger.warn("Error checking group mute status in Cloud Function:", error);
         // Continue with sending notification if mute check fails (fail open)
       }
     }
@@ -153,12 +214,17 @@ export const sendHootNotification = onDocumentCreated(
       },
     };
 
-    // Send notification
+    // Send notification with retry logic for reliability
     try {
-      const result = await expo.sendPushNotificationsAsync([message]);
-      logger.info("Notification sent successfully:", result);
-    } catch (error) {
-      logger.error("Error sending notification:", error);
+      const result = await retryWithBackoff(
+        () => expo.sendPushNotificationsAsync([message]),
+        3, // 3 retries
+        1000 // Start with 1 second delay
+      );
+      logger.info(`Notification sent successfully to ${toUserId} (messageId: ${messageId}):`, result);
+    } catch (error: any) {
+      logger.error(`Failed to send notification to ${toUserId} (messageId: ${messageId}) after retries:`, error);
+      // Log the error but don't throw - we don't want to retry the entire function
     }
   }
 );

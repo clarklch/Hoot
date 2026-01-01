@@ -11,7 +11,7 @@ import { ThemedView } from '@/components/themed-view';
 import { useAuth } from '@/contexts/AuthContext';
 import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { collection, query, where, getDocs, doc, getDoc, addDoc, updateDoc, increment, Timestamp } from 'firebase/firestore';
+import { collection, query, where, getDocs, doc, getDoc, addDoc, updateDoc, increment, Timestamp, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { db } from '@/config/firebase';
 import * as Notifications from 'expo-notifications';
 import { registerForPushNotifications } from '@/services/notifications';
@@ -535,7 +535,7 @@ export default function HomeScreen() {
 
             const recipientData = recipientDoc.data();
             const recipientId = groupMembers[index];
-            const pushToken = recipientData?.pushToken;
+            const pushToken = recipientData?.pushToken; // May be null - Cloud Function will fetch fresh
 
             // Calculate expiration time (24 hours from now)
             const expiresAt = new Date();
@@ -545,15 +545,25 @@ export default function HomeScreen() {
             const fromUserId = user?.uid || 'temp_user';
             const fromUsername = user?.username || 'temp_user';
 
-            // Create message document tagged with THIS specific group
-            const messageDoc = await addDoc(collection(db, 'messages'), {
+            // Use batch write to ensure atomicity: message and notification created together
+            const batch = writeBatch(db);
+
+            // Create message document reference with auto-generated ID
+            const messageDocRef = doc(collection(db, 'messages'));
+            const messageId = messageDocRef.id;
+
+            // Create notification document reference with auto-generated ID
+            const notificationDocRef = doc(collection(db, 'notifications'));
+
+            // Set message document
+            batch.set(messageDocRef, {
               fromUserId: fromUserId,
               fromUsername: fromUsername,
               fromDisplayName: fromDisplayName,
               toUserId: recipientId,
               message: hootText,
-              createdAt: new Date(),
-              expiresAt: expiresAt,
+              createdAt: serverTimestamp(),
+              expiresAt: Timestamp.fromDate(expiresAt),
               viewed: false,
               type: 'hoot',
               groupId: group.id, // Tag with THIS specific group
@@ -561,25 +571,28 @@ export default function HomeScreen() {
               isGroupMessage: true,
             });
 
-            // Store notification data for backend to send push notification
-            if (pushToken) {
-              await addDoc(collection(db, 'notifications'), {
-                fromUserId: fromUserId,
-                fromUsername: fromUsername,
-                fromDisplayName: fromDisplayName,
-                toUserId: recipientId,
-                messageId: messageDoc.id,
-                message: hootText,
-                pushToken: pushToken,
-                timestamp: new Date(),
-                type: 'hoot',
-                groupId: group.id, // Tag with THIS specific group
-                groupName: group.name,
-                isGroupMessage: true,
-              });
-            }
+            // CRITICAL: Always create notification document (even if pushToken is null)
+            // The Cloud Function will fetch the push token fresh from the user document
+            // This ensures every message guarantees a notification attempt
+            batch.set(notificationDocRef, {
+              fromUserId: fromUserId,
+              fromUsername: fromUsername,
+              fromDisplayName: fromDisplayName,
+              toUserId: recipientId,
+              messageId: messageId,
+              message: hootText,
+              pushToken: pushToken || null, // May be null - Cloud Function will fetch fresh if needed
+              timestamp: serverTimestamp(),
+              type: 'hoot',
+              groupId: group.id, // Tag with THIS specific group
+              groupName: group.name,
+              isGroupMessage: true,
+            });
 
-            return { messageId: messageDoc.id, recipientId, pushToken };
+            // Commit batch atomically
+            await batch.commit();
+
+            return { messageId: messageId, recipientId, pushToken };
           });
 
           allMessagePromises.push(...messagePromises);
@@ -608,7 +621,7 @@ export default function HomeScreen() {
 
           const recipientData = recipientDoc.data();
           const recipientId = recipients[index];
-          const pushToken = recipientData?.pushToken;
+          const pushToken = recipientData?.pushToken; // May be null - Cloud Function will fetch fresh
 
           // Calculate expiration time (24 hours from now)
           const expiresAt = new Date();
@@ -618,15 +631,25 @@ export default function HomeScreen() {
           const fromUserId = user?.uid || 'temp_user';
           const fromUsername = user?.username || 'temp_user';
 
-          // Create message document
-          const messageDoc = await addDoc(collection(db, 'messages'), {
+          // Use batch write to ensure atomicity: message and notification created together
+          const batch = writeBatch(db);
+
+          // Create message document reference with auto-generated ID
+          const messageDocRef = doc(collection(db, 'messages'));
+          const messageId = messageDocRef.id;
+
+          // Create notification document reference with auto-generated ID
+          const notificationDocRef = doc(collection(db, 'notifications'));
+
+          // Set message document
+          batch.set(messageDocRef, {
             fromUserId: fromUserId,
             fromUsername: fromUsername,
             fromDisplayName: fromDisplayName,
             toUserId: recipientId,
             message: hootText,
-            createdAt: new Date(),
-            expiresAt: expiresAt,
+            createdAt: serverTimestamp(),
+            expiresAt: Timestamp.fromDate(expiresAt),
             viewed: false,
             type: 'hoot',
             groupId: null,
@@ -634,26 +657,28 @@ export default function HomeScreen() {
             isGroupMessage: false,
           });
 
-          // Store notification data for backend to send push notification
-          // Include messageId so notification can navigate to message view
-          if (pushToken) {
-            await addDoc(collection(db, 'notifications'), {
-              fromUserId: fromUserId,
-              fromUsername: fromUsername,
-              fromDisplayName: fromDisplayName,
-              toUserId: recipientId,
-              messageId: messageDoc.id,
-              message: hootText,
-              pushToken: pushToken,
-              timestamp: new Date(),
-              type: 'hoot',
-              groupId: null,
-              groupName: null,
-              isGroupMessage: false,
-            });
-          }
+          // CRITICAL: Always create notification document (even if pushToken is null)
+          // The Cloud Function will fetch the push token fresh from the user document
+          // This ensures every message guarantees a notification attempt
+          batch.set(notificationDocRef, {
+            fromUserId: fromUserId,
+            fromUsername: fromUsername,
+            fromDisplayName: fromDisplayName,
+            toUserId: recipientId,
+            messageId: messageId,
+            message: hootText,
+            pushToken: pushToken || null, // May be null - Cloud Function will fetch fresh if needed
+            timestamp: serverTimestamp(),
+            type: 'hoot',
+            groupId: null,
+            groupName: null,
+            isGroupMessage: false,
+          });
 
-          return { messageId: messageDoc.id, recipientId, pushToken };
+          // Commit batch atomically
+          await batch.commit();
+
+          return { messageId: messageId, recipientId, pushToken };
         });
 
         await Promise.all(messagePromises);
