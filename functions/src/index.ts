@@ -49,23 +49,138 @@ async function retryWithBackoff<T>(
   throw lastError!;
 }
 
+// Helper function to check push notification receipts and update status
+async function checkReceiptAndUpdateStatus(
+  notificationDocRef: admin.firestore.DocumentReference,
+  receiptId: string
+): Promise<void> {
+  const MAX_RETRY_COUNT = 3;
+  const INITIAL_RECEIPT_CHECK_DELAY = 5000; // Initial delay: 5 seconds
+  
+  // Use loop instead of recursion to avoid stack overflow risks
+  for (let attempt = 0; attempt <= MAX_RETRY_COUNT; attempt++) {
+    // Exponential backoff: 5s, 10s, 20s, 40s
+    const delay = INITIAL_RECEIPT_CHECK_DELAY * Math.pow(2, attempt);
+    
+    if (attempt > 0) {
+      logger.info(`Receipt ${receiptId} check attempt ${attempt + 1}/${MAX_RETRY_COUNT + 1}, waiting ${delay}ms`);
+    }
+    await new Promise(resolve => setTimeout(resolve, delay));
+    
+    try {
+      // Check receipt status
+      const receipts = await expo.getPushNotificationReceiptsAsync([receiptId]);
+      const receipt = receipts[receiptId];
+      
+      if (!receipt) {
+        // Receipt not available yet
+        if (attempt < MAX_RETRY_COUNT) {
+          logger.info(`Receipt ${receiptId} not available yet, will retry`);
+          continue; // Retry in next iteration
+        } else {
+          // Max retries reached, receipt still not available
+          logger.warn(`Receipt ${receiptId} not available after ${MAX_RETRY_COUNT + 1} attempts, marking as sent (assuming delivery)`);
+          
+          // Only update if status is still "sent" (avoid race conditions)
+          const currentDoc = await notificationDocRef.get();
+          const currentData = currentDoc.data();
+          if (currentData?.status === "sent") {
+            await notificationDocRef.update({
+              checkedAt: admin.firestore.FieldValue.serverTimestamp(),
+              // Note: We keep status as "sent" since we can't confirm delivery
+            });
+          }
+          return;
+        }
+      }
+      
+      // Receipt status: 'ok' means delivered, 'error' means failed
+      if (receipt.status === "ok") {
+        logger.info(`Notification delivered successfully (receipt: ${receiptId})`);
+        
+        // Only update if status is still "sent" (avoid race conditions)
+        const currentDoc = await notificationDocRef.get();
+        const currentData = currentDoc.data();
+        if (currentData?.status === "sent") {
+          await notificationDocRef.update({
+            status: "delivered",
+            deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+            checkedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } else {
+          logger.info(`Notification status already changed to ${currentData?.status}, skipping update`);
+        }
+        return; // Success, exit function
+      } else {
+        // Receipt shows an error
+        const errorMessage = (receipt as any).message || "Unknown error";
+        const errorDetails = (receipt as any).details || {};
+        logger.warn(`Notification delivery failed (receipt: ${receiptId}): ${errorMessage}`, errorDetails);
+        
+        // Only update if status is still "sent" (avoid race conditions)
+        const currentDoc = await notificationDocRef.get();
+        const currentData = currentDoc.data();
+        if (currentData?.status === "sent") {
+          await notificationDocRef.update({
+            status: "failed",
+            failureReason: errorMessage,
+            checkedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } else {
+          logger.info(`Notification status already changed to ${currentData?.status}, skipping update`);
+        }
+        return; // Error confirmed, exit function
+      }
+    } catch (error) {
+      // Error checking receipt (network error, etc.)
+      logger.error(`Error checking receipt ${receiptId} (attempt ${attempt + 1}):`, error);
+      
+      if (attempt < MAX_RETRY_COUNT) {
+        // Retry on next iteration
+        continue;
+      } else {
+        // Max retries reached, give up
+        logger.error(`Failed to check receipt ${receiptId} after ${MAX_RETRY_COUNT + 1} attempts, keeping status as "sent"`);
+        // Don't update status - keep as "sent" since we can't confirm either way
+        return;
+      }
+    }
+  }
+}
+
 // Send Hoot notifications when a notification document is created
 export const sendHootNotification = onDocumentCreated(
   "notifications/{notificationId}",
   async (event) => {
+    const notificationDocRef = event.data?.ref;
     const notification = event.data?.data();
     
-    if (!notification) {
+    if (!notification || !notificationDocRef) {
       logger.warn("No notification data found");
       return;
     }
     
+    const notificationId = event.params.notificationId;
     const messageId = notification.messageId;
     const fromUserId = notification.fromUserId;
     const toUserId = notification.toUserId;
     
     if (!toUserId) {
       logger.warn("No toUserId in notification, skipping");
+      return;
+    }
+    
+    // DUPLICATE PREVENTION: Check if notification was already sent
+    // Status can be: undefined/null (pending), "sent", "delivered", "failed"
+    // Note: onDocumentCreated only fires once per document, so we don't need complex locking
+    // However, we check status to handle edge cases (e.g., document updated externally)
+    const currentStatus = notification.status;
+    if (currentStatus === "delivered") {
+      logger.info(`Notification ${notificationId} already delivered, skipping duplicate send`);
+      return;
+    }
+    if (currentStatus === "sent") {
+      logger.info(`Notification ${notificationId} already sent (status: sent), skipping duplicate send`);
       return;
     }
     
@@ -81,6 +196,10 @@ export const sendHootNotification = onDocumentCreated(
       
       if (!recipientDoc.exists) {
         logger.warn(`Recipient user ${toUserId} does not exist, skipping notification`);
+        await notificationDocRef.update({
+          status: "failed",
+          failureReason: "Recipient user does not exist",
+        });
         return;
       }
       
@@ -89,10 +208,18 @@ export const sendHootNotification = onDocumentCreated(
       
       if (!pushToken || !Expo.isExpoPushToken(pushToken)) {
         logger.info(`No valid push token for user ${toUserId}. User may not have registered for notifications yet.`);
+        await notificationDocRef.update({
+          status: "failed",
+          failureReason: "No valid push token",
+        });
         return;
       }
     } catch (error) {
       logger.error(`Error fetching push token for user ${toUserId}:`, error);
+      await notificationDocRef.update({
+        status: "failed",
+        failureReason: `Error fetching push token: ${error}`,
+      });
       return;
     }
     
@@ -215,16 +342,61 @@ export const sendHootNotification = onDocumentCreated(
     };
 
     // Send notification with retry logic for reliability
+    // CRITICAL: Only retry on actual send failures, not on delivery failures
+    // Delivery status is checked separately via receipts
     try {
-      const result = await retryWithBackoff(
+      const tickets = await retryWithBackoff(
         () => expo.sendPushNotificationsAsync([message]),
-        3, // 3 retries
+        3, // 3 retries for sending (network errors, API failures)
         1000 // Start with 1 second delay
       );
-      logger.info(`Notification sent successfully to ${toUserId} (messageId: ${messageId}):`, result);
+      
+      if (!tickets || tickets.length === 0) {
+        throw new Error("No tickets returned from Expo push service");
+      }
+      
+      const ticket = tickets[0];
+      
+      // Tickets can be success (has 'id') or error (has 'message')
+      // Type guard to check if ticket has an id (success ticket)
+      if ('id' in ticket && ticket.id) {
+        const receiptId = ticket.id as string;
+        
+        // Update notification document with status and receipt ID
+        await notificationDocRef.update({
+          status: "sent",
+          receiptId: receiptId,
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        
+        logger.info(`Notification sent successfully to ${toUserId} (messageId: ${messageId}, receiptId: ${receiptId})`);
+        
+        // Check receipt asynchronously (don't await - let it run in background)
+        // This verifies delivery status and updates the notification document
+        checkReceiptAndUpdateStatus(notificationDocRef, receiptId).catch((error) => {
+          logger.error(`Error in receipt check for ${receiptId}:`, error);
+        });
+      } else {
+        // Ticket indicates an error during send
+        const errorMessage = ('message' in ticket ? ticket.message : 'Unknown error') || 'Unknown error';
+        logger.error(`Notification send failed immediately for ${toUserId} (messageId: ${messageId}): ${errorMessage}`);
+        
+        await notificationDocRef.update({
+          status: "failed",
+          failureReason: errorMessage,
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+      
     } catch (error: any) {
       logger.error(`Failed to send notification to ${toUserId} (messageId: ${messageId}) after retries:`, error);
-      // Log the error but don't throw - we don't want to retry the entire function
+      
+      // Update notification document with failure status
+      await notificationDocRef.update({
+        status: "failed",
+        failureReason: error?.message || "Unknown error",
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
     }
   }
 );

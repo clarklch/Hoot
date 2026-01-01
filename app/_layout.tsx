@@ -6,7 +6,7 @@ import 'react-native-reanimated';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
-import { setupNotificationListeners } from '@/services/notifications';
+import { setupNotificationListeners, registerForPushNotifications } from '@/services/notifications';
 import { startMessageCleanup } from '@/services/messageCleanup';
 
 export const unstable_settings = {
@@ -27,6 +27,14 @@ function RootLayoutNav() {
 
     const currentUserId = user.uid;
     console.log('🔔 Setting up notification listeners for user:', currentUserId);
+
+    // CRITICAL: Register push token immediately when app opens (if user is authenticated)
+    // This ensures tokens are always fresh and available, even if user hasn't opened app in a while
+    // Tokens are stored in Firestore and persist, but we refresh them to ensure they're valid
+    registerForPushNotifications(currentUserId).catch((error) => {
+      console.error('Error registering push token on app open:', error);
+      // Don't block app if token registration fails
+    });
 
     // Set up notification listeners with user validation
     const cleanup = setupNotificationListeners((messageId, message, fromUsername, fromUserId, fromDisplayName, groupId, groupName, isGroupMessage) => {
