@@ -35,8 +35,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const notificationCleanupRef = React.useRef<(() => void) | null>(null);
-  // Track if we just signed in to prevent onAuthStateChanged from overwriting state
-  const justSignedInRef = React.useRef<string | null>(null);
 
   useEffect(() => {
     // Firebase Auth automatically persists sessions on native platforms
@@ -48,12 +46,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       console.log('🔐 Auth state changed:', firebaseUser ? `User: ${firebaseUser.uid}` : 'No user');
       
       if (firebaseUser) {
-        const isJustSignedIn = justSignedInRef.current === firebaseUser.uid;
-        
-        if (isJustSignedIn) {
-          console.log('⏭️ onAuthStateChanged: signIn() is handling state update, but ensuring state is set as fallback');
-        }
-        
         console.log('✅ Firebase Auth session detected for user:', firebaseUser.uid);
         console.log('   Email:', firebaseUser.email || 'No email');
         console.log('   Display name:', firebaseUser.displayName || 'No display name');
@@ -66,9 +58,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           console.log('📄 Firestore user document:', userDoc.exists() ? 'exists' : 'does not exist');
           
           // If user document doesn't exist, create it with Firebase Auth user info
-          // CRITICAL: This ensures the document exists even if signIn() failed to create it
           if (!userData || !userDoc.exists()) {
-            console.log('📝 Creating new user document in Firestore from onAuthStateChanged...');
+            console.log('📝 Creating new user document in Firestore...');
             try {
               await setDoc(doc(db, 'users', firebaseUser.uid), {
                 email: firebaseUser.email || null,
@@ -76,21 +67,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 photoURL: firebaseUser.photoURL || null,
                 // username is intentionally omitted for new users
               }, { merge: true });
-              console.log('✅ User document created in onAuthStateChanged');
+              console.log('✅ User document created in Firestore');
               
               // Re-fetch the document to get the updated data
               const updatedDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
               const updatedData = updatedDoc.data();
-              // Use updated data if available
               if (updatedData) {
                 userData = updatedData;
               } else {
-                // Fallback to empty object if re-fetch fails
                 userData = {};
               }
             } catch (createError: any) {
-              console.error('❌ Error creating user document in onAuthStateChanged:', createError);
-              console.error('   Error details:', JSON.stringify(createError, Object.getOwnPropertyNames(createError), 2));
+              console.error('❌ Error creating user document:', createError);
               // Continue even if document creation fails - we'll use Firebase Auth data
               userData = {};
             }
@@ -109,11 +97,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             hasEmail: !!userState.email,
             hasDisplayName: !!userState.displayName,
             hasUsername: !!userState.username,
-            isJustSignedIn: isJustSignedIn,
           });
           
-          // Always set user state - even if signIn() is handling it, this ensures it's set
-          // React will handle deduplication if the state is the same
           setUser(userState);
           
           console.log('✅ User state restored:', {
@@ -238,26 +223,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
 
       console.log('🔥 Signing in with Firebase credential...');
-      console.log('   Auth instance:', !!auth);
       
       // Sign in to Firebase with Apple credential
+      // CRITICAL: onAuthStateChanged will fire automatically and handle setting user state
+      // We do NOT set user state here - let the listener handle it (original working pattern)
       let userCredential;
-      let firebaseUser;
       try {
         userCredential = await signInWithCredential(auth, firebaseCredential);
         console.log('✅ Firebase sign-in successful!');
-        
-        firebaseUser = userCredential.user;
-        
-        // CRITICAL: Set ref IMMEDIATELY after getting the user to prevent race condition
-        // onAuthStateChanged fires when signInWithCredential completes, so we need the ref set right away
-        justSignedInRef.current = firebaseUser.uid;
-        console.log('🔒 Set justSignedInRef to prevent onAuthStateChanged race condition');
       } catch (firebaseError: any) {
         console.error('❌ Firebase sign-in failed:', firebaseError);
         console.error('   Error code:', firebaseError.code);
         console.error('   Error message:', firebaseError.message);
-        console.error('   Full error:', JSON.stringify(firebaseError, null, 2));
         
         // Provide helpful error messages
         if (firebaseError.code === 'auth/operation-not-allowed') {
@@ -270,6 +247,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         throw new Error(`Firebase sign-in failed: ${firebaseError.message || firebaseError.code || 'Unknown error'}`);
       }
       
+      const firebaseUser = userCredential.user;
       if (!firebaseUser) {
         console.error('❌ No user returned from Firebase sign-in');
         throw new Error('No user returned from Firebase sign-in');
@@ -282,23 +260,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
       
       // Get or create user document in Firestore
+      // Use Apple's full name if available (only on first sign-in)
+      // CRITICAL: We must write to Firestore BEFORE onAuthStateChanged processes it
+      // to ensure Apple's full name is captured (only available on first sign-in)
       let userDoc;
       let userData;
       try {
         userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
         userData = userDoc.data();
-        console.log('📄 Firestore user document:', userDoc.exists() ? 'exists' : 'does not exist');
-      } catch (firestoreError: any) {
-        console.error('❌ Error fetching user document:', firestoreError);
-        console.error('   Error details:', JSON.stringify(firestoreError, Object.getOwnPropertyNames(firestoreError), 2));
-        // Continue even if Firestore fetch fails - we'll create the document
+      } catch (getError) {
+        console.error('Error fetching user document in signIn:', getError);
         userDoc = null;
         userData = null;
       }
-      
-      // If user document doesn't exist, this is a new user (or account was deleted)
-      // They should be treated as a new user and prompted to create a username
-      const isNewUser = !userDoc?.exists() || !userData;
       
       // Prepare user data - use Apple's full name if available and not already set
       const displayName = credential.fullName 
@@ -306,100 +280,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         : userData?.displayName || firebaseUser.displayName || null;
       
       // Update or create user document with Apple account info
-      // For new users, we should NOT write username field (omit it entirely)
-      // This ensures onAuthStateChanged reads it as undefined, not null
-      const finalUsername = userData?.username; // Will be undefined for new users
-      
-      // CRITICAL: Ensure Firestore document is created/updated - this MUST succeed
-      // Retry logic to handle transient network errors
-      let documentCreated = false;
-      const maxRetries = 3;
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-          // Build user document - only include username if it exists
-          const userDocData: any = {
-            email: firebaseUser.email || credential.email || userData?.email || null,
-            displayName: displayName,
-            photoURL: firebaseUser.photoURL || userData?.photoURL || null,
-          };
-          
-          // Only add username field if it exists (for existing users)
-          // For new users, omit the field entirely so it reads as undefined
-          if (finalUsername) {
-            userDocData.username = finalUsername;
-          }
-          
-          await setDoc(doc(db, 'users', firebaseUser.uid), userDocData, { merge: true });
-          documentCreated = true;
-          console.log('✅ User document created/updated in Firestore', {
-            hasUsername: !!finalUsername,
-            isNewUser: isNewUser,
-            attempt: attempt,
-          });
-          break; // Success, exit retry loop
-        } catch (firestoreError: any) {
-          console.error(`❌ Error updating user document (attempt ${attempt}/${maxRetries}):`, firestoreError);
-          console.error('   Error code:', firestoreError.code);
-          console.error('   Error message:', firestoreError.message);
-          
-          if (attempt === maxRetries) {
-            // Final attempt failed - log error but continue
-            // onAuthStateChanged will try to create it as a fallback
-            console.error('❌ Failed to create user document after', maxRetries, 'attempts');
-            console.error('   Will rely on onAuthStateChanged to create document');
-          } else {
-            // Wait before retrying (exponential backoff)
-            await new Promise(resolve => setTimeout(resolve, 100 * attempt));
-          }
-        }
-      }
-      
-      if (!documentCreated) {
-        console.warn('⚠️ User document creation failed - onAuthStateChanged will handle it');
-      }
-      
-      // CRITICAL: Immediately update local user state so navigation can happen
-      // This ensures the login screen can navigate to username screen right away
-      // Note: onAuthStateChanged will also fire and update the state, but we set it here
-      // immediately so navigation can happen without waiting for the listener
-      const userState = {
-        uid: firebaseUser.uid,
-        email: firebaseUser.email || credential.email || null,
+      // Preserve existing username if it exists, otherwise omit it (for new users)
+      const userDocData: any = {
+        email: firebaseUser.email || credential.email || userData?.email || null,
         displayName: displayName,
-        username: finalUsername, // Will be undefined for new users (not null)
-        photoURL: firebaseUser.photoURL || null,
+        photoURL: firebaseUser.photoURL || userData?.photoURL || null,
       };
       
-      console.log('👤 Setting user state from signIn():', {
-        uid: userState.uid,
-        hasEmail: !!userState.email,
-        hasDisplayName: !!userState.displayName,
-        hasUsername: !!userState.username,
-        usernameValue: userState.username,
-      });
-      
-      // Set user state immediately - this will trigger navigation in login screen
-      // The onAuthStateChanged listener will also fire, but we've set justSignedInRef
-      // to prevent it from overwriting our state during navigation
-      setUser(userState);
-      
-      // Clear loading state to allow navigation
-      setLoading(false);
-      
-      // Clear the ref after a delay to allow onAuthStateChanged to work normally for future auth changes
-      setTimeout(() => {
-        justSignedInRef.current = null;
-      }, 2000);
-      
-      if (isNewUser) {
-        console.log('🆕 New user detected - will be prompted to create username');
-        console.log('   Navigation should trigger automatically when user state is set');
-      } else {
-        console.log('👋 Returning user - username:', finalUsername || 'none');
+      // Only add username if it exists (preserve existing username)
+      if (userData?.username) {
+        userDocData.username = userData.username;
       }
+      // For new users, username field is omitted (will be undefined when read)
       
-      console.log('✅ Sign-in process complete - user state updated');
-      console.log('   User state:', JSON.stringify(userState, null, 2));
+      await setDoc(doc(db, 'users', firebaseUser.uid), userDocData, { merge: true });
+      console.log('✅ User document updated in Firestore with Apple account info');
+      
+      // CRITICAL: Do NOT set user state here - let onAuthStateChanged handle it
+      // This is the original working pattern that prevents race conditions
+      // onAuthStateChanged will fire automatically and set the user state correctly
+      // Note: Even if onAuthStateChanged fires before this completes, it will read the document
+      // after our write completes (Firestore guarantees consistency)
+      console.log('✅ Sign-in process complete - onAuthStateChanged will handle user state update');
     } catch (error: any) {
       console.error('❌ Sign in error:', error);
       console.error('   Error code:', error.code);
