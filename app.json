@@ -12,6 +12,10 @@
       "bundleIdentifier": "com.sendahoot.app",
       "supportsTablet": true,
       "usesAppleSignIn": true,
+      "entitlements": {
+        "com.apple.developer.applesignin": ["Default"],
+        "aps-environment": "production"
+      },
       "infoPlist": {
         "NSCameraUsageDescription": "We need access to your camera to scan QR codes for adding friends.",
         "NSPhotoLibraryUsageDescription": "We need access to your photos to share images.",
