@@ -3,6 +3,8 @@
     "name": "Hoot",
     "slug": "hoot",
     "version": "1.0.5",
+    "ios": {
+      "buildNumber": "2",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "hoot",
@@ -10,6 +12,7 @@
     "newArchEnabled": true,
     "ios": {
       "bundleIdentifier": "com.sendahoot.app",
+      "buildNumber": "2",
       "supportsTablet": true,
       "usesAppleSignIn": true,
       "infoPlist": {
