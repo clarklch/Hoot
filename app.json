@@ -21,7 +21,6 @@
         "NSPhotoLibraryUsageDescription": "We need access to your photos to share images.",
         "ITSAppUsesNonExemptEncryption": false,
         "UIBackgroundModes": [
-          "remote-notification",
           "remote-notification"
         ],
         "CFBundleURLTypes": [

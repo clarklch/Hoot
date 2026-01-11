@@ -10,6 +10,7 @@
       "cache": {
         "disabled": false
       },
+      "resourceClass": "m-medium",
       "ios": {
         "simulator": true,
         "env": {
@@ -22,6 +23,7 @@
       "cache": {
         "disabled": false
       },
+      "resourceClass": "m-medium",
       "ios": {
         "simulator": false,
         "env": {
@@ -34,6 +36,7 @@
       "cache": {
         "disabled": false
       },
+      "resourceClass": "m-medium",
       "ios": {
         "simulator": false,
         "env": {

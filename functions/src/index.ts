@@ -398,15 +398,22 @@ export const sendHootNotification = onDocumentCreated(
     }
     
     // Create notification message
-    // _contentAvailable: true allows iOS to wake the app in the background when closed
-    // priority: 'high' ensures the notification is delivered immediately
+    // CRITICAL: This is a REMOTE push notification via Expo Push Notification Service → APNs → iOS
+    // Remote push notifications with alerts (title/body/sound) WORK when app is fully closed
+    // Requirements for iOS delivery when app is closed:
+    // 1. title + body (alert payload) - REQUIRED - tells iOS to display notification even when app closed
+    // 2. sound - REQUIRED - ensures notification is displayed with sound
+    // 3. priority: 'high' - Ensures immediate delivery via APNs
+    // 4. _contentAvailable: true (Expo format) - Optional - allows iOS to wake app for background data processing
+    // Note: Having title/body/sound means this is a standard alert notification (not silent)
+    // Standard alert notifications are ALWAYS delivered by APNs even when app is terminated
     const message = {
       to: pushToken,
       sound: "default" as const,
       title: notificationTitle,
       body: notification.message || "Hoot!",
       priority: "high" as const,
-      _contentAvailable: true, // Required for background notifications when app is closed
+      _contentAvailable: true, // Expo format - allows iOS to wake app for background processing (optional)
       data: {
         type: "hoot",
         messageId: messageId,
@@ -541,13 +548,22 @@ async function retryPendingNotification(
     }
 
     // Create notification message
+    // CRITICAL: This is a REMOTE push notification via Expo Push Notification Service → APNs → iOS
+    // Remote push notifications with alerts (title/body/sound) WORK when app is fully closed
+    // Requirements for iOS delivery when app is closed:
+    // 1. title + body (alert payload) - REQUIRED - tells iOS to display notification even when app closed
+    // 2. sound - REQUIRED - ensures notification is displayed with sound
+    // 3. priority: 'high' - Ensures immediate delivery via APNs
+    // 4. _contentAvailable: true (Expo format) - Optional - allows iOS to wake app for background data processing
+    // Note: Having title/body/sound means this is a standard alert notification (not silent)
+    // Standard alert notifications are ALWAYS delivered by APNs even when app is terminated
     const message = {
       to: pushToken,
       sound: "default" as const,
       title: notificationTitle,
       body: notification.message || "Hoot!",
       priority: "high" as const,
-      _contentAvailable: true,
+      _contentAvailable: true, // Expo format - allows iOS to wake app for background processing (optional)
       data: {
         type: "hoot",
         messageId: messageId,
@@ -729,8 +745,9 @@ export const sendFriendRequestNotification = onDocumentCreated(
                                "Someone";
 
     // Send notification
-    // _contentAvailable: true allows iOS to wake the app in the background when closed
-    // priority: 'high' ensures the notification is delivered immediately
+    // CRITICAL: This is a REMOTE push notification via Expo Push Notification Service → APNs → iOS
+    // Remote push notifications with alerts (title/body/sound) WORK when app is fully closed
+    // Standard alert notifications are ALWAYS delivered by APNs even when app is terminated
     try {
       await expo.sendPushNotificationsAsync([{
         to: pushToken,
@@ -738,7 +755,7 @@ export const sendFriendRequestNotification = onDocumentCreated(
         title: "New Friend Request",
         body: `${requesterUsername} wants to be your friend`,
         priority: "high" as const,
-        _contentAvailable: true, // Required for background notifications when app is closed
+        _contentAvailable: true, // Expo format - allows iOS to wake app for background processing (optional)
         data: {
           type: "friend_request",
           friendshipId: event.params.friendshipId,
