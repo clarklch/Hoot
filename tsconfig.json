@@ -4,6 +4,8 @@
     "strict": true,
     "incremental": true,
     "tsBuildInfoFile": ".tsbuildinfo",
+    "skipLibCheck": true,
+    "isolatedModules": true,
     "paths": {
       "@/*": [
         "./*"

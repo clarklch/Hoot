@@ -12,7 +12,7 @@ import { ThemedView } from '@/components/themed-view';
 import { useAuth } from '@/contexts/AuthContext';
 import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { doc, getDoc, setDoc, collection, query, where, getDocs, addDoc, deleteDoc, Timestamp, updateDoc, arrayRemove } from 'firebase/firestore';
+import { doc, getDoc, setDoc, collection, query, where, getDocs, addDoc, deleteDoc, Timestamp, updateDoc, arrayRemove, serverTimestamp } from 'firebase/firestore';
 import { deleteUser } from 'firebase/auth';
 import { db, auth } from '@/config/firebase';
 import { clearPushToken, registerForPushNotifications } from '@/services/notifications';
@@ -487,26 +487,29 @@ export default function SettingsScreen() {
                           const remainingMembers = memberIds.filter((id: string) => id !== currentUserId);
 
                           // Send notifications to remaining members about group deletion
+                          // CRITICAL: Always create notification documents (even if pushToken is null)
+                          // The Cloud Function will fetch the push token fresh from the user document
+                          // This ensures every notification guarantees a delivery attempt
                           const notificationPromises = remainingMembers.map(async (memberId: string) => {
                             try {
                               const memberDoc = await getDoc(doc(db, 'users', memberId));
                               const memberData = memberDoc.data();
-                              const pushToken = memberData?.pushToken;
+                              const pushToken = memberData?.pushToken; // May be null - Cloud Function will fetch fresh
 
-                              if (pushToken) {
-                                await addDoc(collection(db, 'notifications'), {
-                                  pushToken: pushToken,
-                                  message: `${displayName || username || 'The creator'} deleted the group "${groupName}"`,
-                                  fromUserId: currentUserId,
-                                  fromUsername: username || 'Unknown',
-                                  fromDisplayName: displayName || username || 'Unknown',
-                                  toUserId: memberId,
-                                  timestamp: new Date(),
-                                  type: 'group_deleted',
-                                  groupId: groupId,
-                                  groupName: groupName,
-                                });
-                              }
+                              // Always create notification document, regardless of push token state
+                              await addDoc(collection(db, 'notifications'), {
+                                pushToken: pushToken || null, // May be null - Cloud Function will fetch fresh if needed
+                                message: `${displayName || username || 'The creator'} deleted the group "${groupName}"`,
+                                fromUserId: currentUserId,
+                                fromUsername: username || 'Unknown',
+                                fromDisplayName: displayName || username || 'Unknown',
+                                toUserId: memberId,
+                                timestamp: serverTimestamp(), // Use serverTimestamp for accurate time sync
+                                type: 'group_deleted',
+                                groupId: groupId,
+                                groupName: groupName,
+                                isGroupMessage: false, // Event notification, not a message
+                              });
                             } catch (error) {
                               console.error(`Error notifying member ${memberId}:`, error);
                             }
@@ -540,27 +543,30 @@ export default function SettingsScreen() {
                           });
 
                           // Send notifications to remaining members that user left
+                          // CRITICAL: Always create notification documents (even if pushToken is null)
+                          // The Cloud Function will fetch the push token fresh from the user document
+                          // This ensures every notification guarantees a delivery attempt
                           const remainingMembers = memberIds.filter((id: string) => id !== currentUserId);
                           const notificationPromises = remainingMembers.map(async (memberId: string) => {
                             try {
                               const memberDoc = await getDoc(doc(db, 'users', memberId));
                               const memberData = memberDoc.data();
-                              const pushToken = memberData?.pushToken;
+                              const pushToken = memberData?.pushToken; // May be null - Cloud Function will fetch fresh
 
-                              if (pushToken) {
-                                await addDoc(collection(db, 'notifications'), {
-                                  pushToken: pushToken,
-                                  message: `${displayName || username || 'A member'} left the group "${groupName}"`,
-                                  fromUserId: currentUserId,
-                                  fromUsername: username || 'Unknown',
-                                  fromDisplayName: displayName || username || 'Unknown',
-                                  toUserId: memberId,
-                                  timestamp: new Date(),
-                                  type: 'member_left',
-                                  groupId: groupId,
-                                  groupName: groupName,
-                                });
-                              }
+                              // Always create notification document, regardless of push token state
+                              await addDoc(collection(db, 'notifications'), {
+                                pushToken: pushToken || null, // May be null - Cloud Function will fetch fresh if needed
+                                message: `${displayName || username || 'A member'} left the group "${groupName}"`,
+                                fromUserId: currentUserId,
+                                fromUsername: username || 'Unknown',
+                                fromDisplayName: displayName || username || 'Unknown',
+                                toUserId: memberId,
+                                timestamp: serverTimestamp(), // Use serverTimestamp for accurate time sync
+                                type: 'member_left',
+                                groupId: groupId,
+                                groupName: groupName,
+                                isGroupMessage: false, // Event notification, not a message
+                              });
                             } catch (error) {
                               console.error(`Error notifying member ${memberId}:`, error);
                             }

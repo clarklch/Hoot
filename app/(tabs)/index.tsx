@@ -5,7 +5,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { isFriendMuted, isGroupMuted } from '@/utils/muteHelpers';
-import { validateStreak } from '@/utils/streakHelpers';
+import { validateStreak, calculateStreak } from '@/utils/streakHelpers';
 import React from 'react';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -15,7 +15,6 @@ import { useColorScheme } from '@/hooks/use-color-scheme';
 import { collection, query, where, getDocs, doc, getDoc, addDoc, updateDoc, increment, Timestamp, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { db } from '@/config/firebase';
 import * as Notifications from 'expo-notifications';
-import { refreshPushTokenIfNeeded } from '@/services/notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { IconSymbol } from '@/components/ui/icon-symbol';
 import { Friend, Group } from '@/types';
@@ -231,21 +230,8 @@ export default function HomeScreen() {
 
   useEffect(() => {
     loadFriendsAndGroups();
-    // Refresh push token if needed - ONLY for authenticated users
-    // Note: _layout.tsx also handles token refresh, but this ensures token is checked
-    // when this screen loads (e.g., after navigation). The smart refresh function
-    // will skip if token was recently refreshed to avoid unnecessary refreshes.
-    const refreshPushToken = async () => {
-      // CRITICAL: Only refresh if we have a valid authenticated user
-      if (user?.uid) {
-        console.log('📱 Checking push token refresh for authenticated user:', user.uid);
-        await refreshPushTokenIfNeeded(user.uid);
-      } else {
-        console.log('⚠️ Skipping push token refresh: No authenticated user');
-      }
-    };
-    refreshPushToken();
-
+    // Note: Token refresh is handled in _layout.tsx on app open and AppState changes
+    // No need to refresh here as it would be redundant and could cause race conditions
   }, [user]);
 
   // Refresh groups and friends when screen comes into focus
@@ -536,7 +522,9 @@ export default function HomeScreen() {
           if (!groupObj) continue;
 
           // Get members of this specific group, excluding the sender
-          const groupMembers = groupObj.memberIds.filter(memberId => memberId !== currentUserId);
+          // CRITICAL: Safety check for memberIds - ensure it's always an array
+          const memberIds = groupObj.memberIds || [];
+          const groupMembers = memberIds.filter(memberId => memberId !== currentUserId);
           if (groupMembers.length === 0) continue;
 
           // Get recipient data for this group's members
@@ -706,8 +694,8 @@ export default function HomeScreen() {
       // Trigger hoot emoji animation only after successful send
       animateHootEmoji();
 
-      // Update streaks for selected users and groups
-      const today = new Date().toISOString().split('T')[0];
+      // Update streaks for selected users and groups using 24-hour time windows
+      const now = new Date().toISOString(); // Store full timestamp for accurate 24-hour tracking
 
       // Update streaks for selected users
       if (sendMode === 'users' && selectedUsers.length > 0) {
@@ -727,33 +715,21 @@ export default function HomeScreen() {
                 const friendshipDoc = friendshipSnapshot.docs[0];
                 const friendshipData = friendshipDoc.data();
                 const lastHootDate = friendshipData.lastHootDate;
-                let newStreakCount = 1;
+                const currentStreak = friendshipData.streakCount || 0;
 
-                if (lastHootDate) {
-                  const lastDate = new Date(lastHootDate);
-                  const todayDate = new Date(today);
-                  const daysDiff = Math.floor((todayDate.getTime() - lastDate.getTime()) / (1000 * 60 * 60 * 24));
-
-                  if (daysDiff === 1) {
-                    // Consecutive day - increment streak
-                    newStreakCount = (friendshipData.streakCount || 0) + 1;
-                  } else if (daysDiff === 0) {
-                    // Same day - keep current streak
-                    newStreakCount = friendshipData.streakCount || 0;
-                  }
-                  // If daysDiff > 1, streak is broken, start at 1
-                }
+                // Calculate new streak count based on 24-hour time window
+                const newStreakCount = calculateStreak(currentStreak, lastHootDate);
 
                 await updateDoc(friendshipDoc.ref, {
                   streakCount: newStreakCount,
-                  lastHootDate: today,
+                  lastHootDate: now, // Store full timestamp
                 });
 
                 // Update local state
                 setFriends(prevFriends =>
                   prevFriends.map(f =>
                     f.friendId === userId
-                      ? { ...f, streakCount: newStreakCount, lastHootDate: today }
+                      ? { ...f, streakCount: newStreakCount, lastHootDate: now }
                       : f
                   )
                 );
@@ -775,33 +751,21 @@ export default function HomeScreen() {
 
               if (groupData) {
                 const lastHootDate = groupData.lastHootDate;
-                let newStreakCount = 1;
+                const currentStreak = groupData.streakCount || 0;
 
-                if (lastHootDate) {
-                  const lastDate = new Date(lastHootDate);
-                  const todayDate = new Date(today);
-                  const daysDiff = Math.floor((todayDate.getTime() - lastDate.getTime()) / (1000 * 60 * 60 * 24));
-
-                  if (daysDiff === 1) {
-                    // Consecutive day - increment streak
-                    newStreakCount = (groupData.streakCount || 0) + 1;
-                  } else if (daysDiff === 0) {
-                    // Same day - keep current streak
-                    newStreakCount = groupData.streakCount || 0;
-                  }
-                  // If daysDiff > 1, streak is broken, start at 1
-                }
+                // Calculate new streak count based on 24-hour time window
+                const newStreakCount = calculateStreak(currentStreak, lastHootDate);
 
                 await updateDoc(groupDoc, {
                   streakCount: newStreakCount,
-                  lastHootDate: today,
+                  lastHootDate: now, // Store full timestamp
                 });
 
                 // Update local state
                 setGroups(prevGroups =>
                   prevGroups.map(g =>
                     g.id === groupId
-                      ? { ...g, streakCount: newStreakCount, lastHootDate: today }
+                      ? { ...g, streakCount: newStreakCount, lastHootDate: now }
                       : g
                   )
                 );
@@ -1614,7 +1578,7 @@ export default function HomeScreen() {
                                   color: selectedGroups.includes(group.id) ? '#fff' : '#000',
                                 },
                               ]}>
-                              {group.memberIds.length} member(s)
+                              {(group.memberIds || []).length} member(s)
                             </ThemedText>
                           </View>
                           <View style={styles.selectionItemRight}>

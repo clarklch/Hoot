@@ -136,36 +136,10 @@ export async function registerForPushNotifications(userId: string, forceRefresh:
     
     await Promise.all(clearSameTokenPromises);
     
-    // ADDITIONAL SAFEGUARD: Also clear push tokens from any other users on this device
-    // This prevents notifications from being sent to old test accounts
-    // We'll get all users and check if they have any push token, then clear it if they're not the current user
-    // Note: This is more aggressive but necessary to prevent cross-user notifications
-    console.log('🔍 Clearing push tokens from all other users to prevent cross-user notifications...');
-    try {
-      const allUsersQuery = query(collection(db, 'users'));
-      const allUsersSnapshot = await getDocs(allUsersQuery);
-      
-      const clearAllPromises = allUsersSnapshot.docs
-        .filter(docSnap => {
-          const userData = docSnap.data();
-          // Only clear if user has a push token and is not the current user
-          return docSnap.id !== userId && userData?.pushToken && userData.pushToken !== null;
-        })
-        .map(async (docSnap) => {
-          try {
-            await updateDoc(docSnap.ref, { pushToken: null });
-            console.log(`🧹 Cleared push token from other user: ${docSnap.id}`);
-          } catch (error) {
-            console.error(`Error clearing push token from user ${docSnap.id}:`, error);
-          }
-        });
-      
-      await Promise.all(clearAllPromises);
-      console.log('✅ Cleared push tokens from all other users');
-    } catch (error) {
-      console.error('Error clearing push tokens from all users:', error);
-      // Don't fail the registration if this cleanup fails
-    }
+    // Note: We only clear tokens that match the EXACT same push token (above)
+    // We do NOT clear tokens from all other users, as that would break notifications
+    // for users who haven't opened the app recently. Push tokens are device-specific,
+    // so different users on different devices will have different tokens.
     
     // Now save the token for the current user with refresh timestamp
     console.log('💾 Saving push token to Firestore for user:', userId);
@@ -265,45 +239,75 @@ export async function shouldRefreshPushToken(userId: string, forceRefresh: boole
   }
 }
 
+// Global concurrency protection for token refresh
+// Prevents multiple simultaneous refresh attempts for the same user
+const activeRefreshes = new Map<string, Promise<string | null>>();
+
 /**
  * Refresh push token if needed (checks last refresh time first)
+ * Includes concurrency protection to prevent multiple simultaneous refreshes
  * @param userId - The user ID to refresh token for
  * @returns The push token string, or null if refresh failed or wasn't needed
  */
 export async function refreshPushTokenIfNeeded(userId: string): Promise<string | null> {
   console.log(`🔄 refreshPushTokenIfNeeded called for user: ${userId}`);
-  const needsRefresh = await shouldRefreshPushToken(userId);
   
-  if (!needsRefresh) {
-    // Token is fresh, just return existing token from Firestore
+  // CRITICAL: Check if a refresh is already in progress for this user
+  // If so, wait for the existing refresh to complete instead of starting a new one
+  const existingRefresh = activeRefreshes.get(userId);
+  if (existingRefresh) {
+    console.log(`⏳ Token refresh already in progress for user ${userId}, waiting for existing refresh...`);
     try {
-      const userDocRef = doc(db, 'users', userId);
-      const userDoc = await getDoc(userDocRef);
-      
-      if (userDoc.exists()) {
-        const existingToken = userDoc.data()?.pushToken;
-        if (existingToken) {
-          console.log(`✅ Existing token found for user ${userId}, skipping refresh`);
-          return existingToken;
-        } else {
-          console.warn(`⚠️ No existing token found for user ${userId} (needsRefresh=false but token is null), forcing refresh`);
-          // Token should exist but doesn't - force refresh
-          return await registerForPushNotifications(userId, true);
-        }
-      } else {
-        console.warn(`⚠️ User document doesn't exist for user ${userId}, forcing refresh`);
-        return await registerForPushNotifications(userId, true);
-      }
+      return await existingRefresh;
     } catch (error) {
-      console.error('❌ Error getting existing token, proceeding with refresh:', error);
+      console.error('Error waiting for existing refresh:', error);
+      // Continue to start a new refresh if the existing one failed
     }
-    
-    // If we can't get existing token, proceed with refresh
-    return await registerForPushNotifications(userId, false);
   }
   
-  console.log(`🔄 Token refresh needed for user ${userId}, registering now...`);
-  return await registerForPushNotifications(userId, false);
+  // Start a new refresh (protected by concurrency guard)
+  const refreshPromise = (async () => {
+    try {
+      const needsRefresh = await shouldRefreshPushToken(userId);
+      
+      if (!needsRefresh) {
+        // Token is fresh, just return existing token from Firestore
+        try {
+          const userDocRef = doc(db, 'users', userId);
+          const userDoc = await getDoc(userDocRef);
+          
+          if (userDoc.exists()) {
+            const existingToken = userDoc.data()?.pushToken;
+            if (existingToken) {
+              console.log(`✅ Existing token found for user ${userId}, skipping refresh`);
+              return existingToken;
+            } else {
+              console.warn(`⚠️ No existing token found for user ${userId} (needsRefresh=false but token is null), forcing refresh`);
+              // Token should exist but doesn't - force refresh
+              return await registerForPushNotifications(userId, true);
+            }
+          } else {
+            console.warn(`⚠️ User document doesn't exist for user ${userId}, forcing refresh`);
+            return await registerForPushNotifications(userId, true);
+          }
+        } catch (error) {
+          console.error('❌ Error getting existing token, proceeding with refresh:', error);
+          return await registerForPushNotifications(userId, false);
+        }
+      }
+      
+      console.log(`🔄 Token refresh needed for user ${userId}, registering now...`);
+      return await registerForPushNotifications(userId, false);
+    } finally {
+      // Remove from active refreshes map when done
+      activeRefreshes.delete(userId);
+    }
+  })();
+  
+  // Store the promise in the active refreshes map
+  activeRefreshes.set(userId, refreshPromise);
+  
+  return refreshPromise;
 }
 
 /**

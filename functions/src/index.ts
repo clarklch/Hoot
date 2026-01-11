@@ -137,19 +137,35 @@ async function checkReceiptAndUpdateStatus(
           const toUserId = notificationData?.toUserId;
           
           if (toUserId) {
-            logger.warn(`Invalid/expired push token detected for user ${toUserId}. Clearing token from Firestore.`);
+            logger.warn(`Invalid/expired push token detected for user ${toUserId}. Error: ${errorMessage}`);
+            logger.warn(`Token error details:`, JSON.stringify(errorDetails));
             
-            try {
-              // Clear the invalid token from user's document
-              // This will force the app to refresh the token on next app open
-              const userDocRef = admin.firestore().collection("users").doc(toUserId);
-              await userDocRef.update({
-                pushToken: null,
-                pushTokenLastRefreshed: null,
-              });
-              logger.info(`Cleared invalid push token for user ${toUserId}`);
-            } catch (clearError) {
-              logger.error(`Error clearing invalid push token for user ${toUserId}:`, clearError);
+            // CRITICAL: Only clear token if Expo explicitly says it's invalid
+            // DeviceNotRegistered means the token is permanently invalid (app uninstalled, etc.)
+            // We should clear it so the app can refresh on next open
+            // However, we should be conservative - only clear on definitive errors
+            const isDefinitiveError = 
+              errorMessage.includes("DeviceNotRegistered") ||
+              errorMessage.includes("InvalidRegistrationToken") ||
+              (errorDetails as any)?.error === "DeviceNotRegistered";
+            
+            if (isDefinitiveError) {
+              try {
+                // Clear the invalid token from user's document
+                // This will force the app to refresh the token on next app open
+                const userDocRef = admin.firestore().collection("users").doc(toUserId);
+                await userDocRef.update({
+                  pushToken: null,
+                  pushTokenLastRefreshed: null,
+                });
+                logger.info(`Cleared invalid push token for user ${toUserId} (definitive error: ${errorMessage})`);
+              } catch (clearError) {
+                logger.error(`Error clearing invalid push token for user ${toUserId}:`, clearError);
+              }
+            } else {
+              // For less definitive errors (like InvalidCredentials), log but don't clear
+              // The token might still be valid, just had a temporary issue
+              logger.warn(`Token error for user ${toUserId} is not definitive, keeping token: ${errorMessage}`);
             }
           }
         }
@@ -1016,6 +1032,160 @@ export const cleanupDeferredMissedMessages = onSchedule(
       logger.info(`Deferred missed messages cleanup completed: ${deletedCount} old entries deleted`);
     } catch (error) {
       logger.error("Error during deferred missed messages cleanup:", error);
+      throw error; // Re-throw to mark the function as failed
+    }
+  }
+);
+
+// Cleanup #6: Scheduled streak reset for broken streaks
+// Runs hourly to reset streakCount to 0 for friendships and groups where lastHootDate is more than 24 hours ago
+// This ensures Firestore data stays in sync with the client-side validation logic and provides more timely updates
+export const resetBrokenStreaks = onSchedule(
+  {
+    schedule: "every 1 hours", // Run hourly
+    timeZone: "America/Los_Angeles", // Adjust to your timezone
+  },
+  async (event) => {
+    logger.info("Starting scheduled streak reset for broken streaks...");
+    const db = admin.firestore();
+    const now = admin.firestore.Timestamp.now();
+    let friendshipResetCount = 0;
+    let groupResetCount = 0;
+
+    try {
+      // Reset broken streaks in friendships
+      logger.info("Checking friendships for broken streaks...");
+      const friendshipsSnapshot = await db.collection("friendships").get();
+      
+      let friendshipBatch = db.batch();
+      let friendshipBatchCount = 0;
+
+      for (const doc of friendshipsSnapshot.docs) {
+        const data = doc.data();
+        const streakCount = data.streakCount || 0;
+        const lastHootDate = data.lastHootDate;
+
+        // Skip if no streak to reset or no lastHootDate
+        if (streakCount === 0 || !lastHootDate) {
+          continue;
+        }
+
+        // Parse lastHootDate - handle both ISO string and Firestore Timestamp
+        let lastDate: Date;
+        if (lastHootDate.toDate) {
+          // Firestore Timestamp
+          lastDate = lastHootDate.toDate();
+        } else if (typeof lastHootDate === 'string') {
+          // ISO string or date-only string (YYYY-MM-DD)
+          if (lastHootDate.match(/^\d{4}-\d{2}-\d{2}$/)) {
+            // Date-only format (backward compatibility) - treat as start of that day
+            lastDate = new Date(lastHootDate + 'T00:00:00.000Z');
+          } else {
+            lastDate = new Date(lastHootDate);
+          }
+        } else {
+          continue; // Invalid format, skip
+        }
+
+        // Check if date is valid
+        if (isNaN(lastDate.getTime())) {
+          continue; // Invalid date, skip
+        }
+
+        // Calculate time difference in hours
+        const timeDiff = now.toMillis() - lastDate.getTime();
+        const hoursDiff = timeDiff / (1000 * 60 * 60);
+
+        // If more than 24 hours have passed, reset streak to 0
+        if (hoursDiff > 24) {
+          friendshipBatch.update(doc.ref, { streakCount: 0 });
+          friendshipBatchCount++;
+          friendshipResetCount++;
+
+          // Commit batch if we reach the Firestore batch limit (500)
+          if (friendshipBatchCount >= 500) {
+            await friendshipBatch.commit();
+            logger.info(`Reset batch of ${friendshipBatchCount} friendship streaks`);
+            friendshipBatchCount = 0;
+            friendshipBatch = db.batch(); // Create new batch
+          }
+        }
+      }
+
+      // Commit remaining friendship updates
+      if (friendshipBatchCount > 0) {
+        await friendshipBatch.commit();
+        logger.info(`Reset final batch of ${friendshipBatchCount} friendship streaks`);
+      }
+
+      // Reset broken streaks in groups
+      logger.info("Checking groups for broken streaks...");
+      const groupsSnapshot = await db.collection("groups").get();
+      
+      let groupBatch = db.batch();
+      let groupBatchCount = 0;
+
+      for (const doc of groupsSnapshot.docs) {
+        const data = doc.data();
+        const streakCount = data.streakCount || 0;
+        const lastHootDate = data.lastHootDate;
+
+        // Skip if no streak to reset or no lastHootDate
+        if (streakCount === 0 || !lastHootDate) {
+          continue;
+        }
+
+        // Parse lastHootDate - handle both ISO string and Firestore Timestamp
+        let lastDate: Date;
+        if (lastHootDate.toDate) {
+          // Firestore Timestamp
+          lastDate = lastHootDate.toDate();
+        } else if (typeof lastHootDate === 'string') {
+          // ISO string or date-only string (YYYY-MM-DD)
+          if (lastHootDate.match(/^\d{4}-\d{2}-\d{2}$/)) {
+            // Date-only format (backward compatibility) - treat as start of that day
+            lastDate = new Date(lastHootDate + 'T00:00:00.000Z');
+          } else {
+            lastDate = new Date(lastHootDate);
+          }
+        } else {
+          continue; // Invalid format, skip
+        }
+
+        // Check if date is valid
+        if (isNaN(lastDate.getTime())) {
+          continue; // Invalid date, skip
+        }
+
+        // Calculate time difference in hours
+        const timeDiff = now.toMillis() - lastDate.getTime();
+        const hoursDiff = timeDiff / (1000 * 60 * 60);
+
+        // If more than 24 hours have passed, reset streak to 0
+        if (hoursDiff > 24) {
+          groupBatch.update(doc.ref, { streakCount: 0 });
+          groupBatchCount++;
+          groupResetCount++;
+
+          // Commit batch if we reach the Firestore batch limit (500)
+          if (groupBatchCount >= 500) {
+            await groupBatch.commit();
+            logger.info(`Reset batch of ${groupBatchCount} group streaks`);
+            groupBatchCount = 0;
+            groupBatch = db.batch(); // Create new batch
+          }
+        }
+      }
+
+      // Commit remaining group updates
+      if (groupBatchCount > 0) {
+        await groupBatch.commit();
+        logger.info(`Reset final batch of ${groupBatchCount} group streaks`);
+      }
+
+      logger.info(`Streak reset completed: ${friendshipResetCount} friendships reset, ${groupResetCount} groups reset`);
+    } catch (error) {
+      logger.error("Error during streak reset:", error);
       throw error; // Re-throw to mark the function as failed
     }
   }
