@@ -12,7 +12,7 @@ import { ThemedView } from '@/components/themed-view';
 import { useAuth } from '@/contexts/AuthContext';
 import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { collection, query, where, getDocs, doc, getDoc, addDoc, updateDoc, increment, Timestamp, writeBatch, serverTimestamp, onSnapshot, Unsubscribe } from 'firebase/firestore';
+import { collection, query, where, getDocs, doc, getDoc, addDoc, updateDoc, increment, Timestamp, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { db } from '@/config/firebase';
 import * as Notifications from 'expo-notifications';
 import { refreshPushTokenIfNeeded } from '@/services/notifications';
@@ -141,7 +141,6 @@ export default function HomeScreen() {
   const [favoriteOrder, setFavoriteOrder] = useState<string[]>([]);
   const [favoriteGroupOrder, setFavoriteGroupOrder] = useState<string[]>([]);
   const [favoritesMode, setFavoritesMode] = useState<'friends' | 'groups'>('friends');
-  const notificationListenersRef = useRef<Map<string, Unsubscribe>>(new Map());
   const scrollViewRef = useRef<ScrollView>(null);
   const searchInputRef = useRef<TextInput>(null);
   const hootEmojiOpacity = useRef(new Animated.Value(1)).current;
@@ -247,13 +246,6 @@ export default function HomeScreen() {
     };
     refreshPushToken();
 
-    // Cleanup notification listeners on unmount
-    return () => {
-      notificationListenersRef.current.forEach((unsubscribe) => {
-        unsubscribe();
-      });
-      notificationListenersRef.current.clear();
-    };
   }, [user]);
 
   // Refresh groups and friends when screen comes into focus
