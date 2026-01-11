@@ -7,6 +7,9 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
+      "cache": {
+        "disabled": false
+      },
       "ios": {
         "simulator": true,
         "env": {
@@ -16,6 +19,9 @@
     },
     "preview": {
       "distribution": "internal",
+      "cache": {
+        "disabled": false
+      },
       "ios": {
         "simulator": false,
         "env": {
@@ -25,6 +31,9 @@
     },
     "production": {
       "distribution": "store",
+      "cache": {
+        "disabled": false
+      },
       "ios": {
         "simulator": false,
         "env": {
