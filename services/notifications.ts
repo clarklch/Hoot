@@ -1,10 +1,11 @@
 // Notification service for handling push notifications
 import * as Notifications from 'expo-notifications';
-import { Platform } from 'react-native';
+import { Platform, AppState, AppStateStatus } from 'react-native';
 import Constants from 'expo-constants';
-import { doc, setDoc, getDoc, updateDoc, collection, query, where, getDocs } from 'firebase/firestore';
+import { doc, setDoc, getDoc, updateDoc, collection, query, where, getDocs, Timestamp } from 'firebase/firestore';
 import { db } from '@/config/firebase';
 import * as Linking from 'expo-linking';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Configure notification handler
 Notifications.setNotificationHandler({
@@ -15,14 +16,21 @@ Notifications.setNotificationHandler({
   }),
 });
 
-export async function registerForPushNotifications(userId: string): Promise<string | null> {
+/**
+ * Register or refresh push token for a user
+ * This function intelligently refreshes tokens to prevent expiration issues
+ * @param userId - The user ID to register the token for
+ * @param forceRefresh - If true, always refresh the token even if it hasn't changed
+ * @returns The push token string, or null if registration failed
+ */
+export async function registerForPushNotifications(userId: string, forceRefresh: boolean = false): Promise<string | null> {
   try {
     if (!userId || userId === 'temp_user') {
       console.log('⚠️ Cannot register push token: Invalid user ID');
       return null;
     }
 
-    console.log('📱 Registering push token for user:', userId);
+    console.log('📱 Registering push token for user:', userId, forceRefresh ? '(forced refresh)' : '');
     
     // Request permissions
     const { status: existingStatus } = await Notifications.getPermissionsAsync();
@@ -74,6 +82,33 @@ export async function registerForPushNotifications(userId: string): Promise<stri
         throw new Error(errorMsg);
       }
       throw error;
+    }
+
+    const newToken = tokenData.data;
+
+    // CRITICAL: Check if token actually changed to avoid unnecessary Firestore writes
+    // This prevents unnecessary refreshes and reduces Firestore costs
+    if (!forceRefresh) {
+      try {
+        const userDocRef = doc(db, 'users', userId);
+        const userDoc = await getDoc(userDocRef);
+        
+        if (userDoc.exists()) {
+          const existingToken = userDoc.data()?.pushToken;
+          
+          // If token hasn't changed, just update the timestamp and return early
+          if (existingToken === newToken) {
+            console.log('✅ Push token unchanged, updating refresh timestamp only');
+            await updateDoc(userDocRef, {
+              pushTokenLastRefreshed: Timestamp.now(),
+            });
+            return newToken;
+          }
+        }
+      } catch (error) {
+        console.warn('Error checking existing token, proceeding with full registration:', error);
+        // Continue with full registration if check fails
+      }
     }
 
     // CRITICAL: Clear this push token from all other users' documents
@@ -131,20 +166,132 @@ export async function registerForPushNotifications(userId: string): Promise<stri
       // Don't fail the registration if this cleanup fails
     }
     
-    // Now save the token for the current user
+    // Now save the token for the current user with refresh timestamp
     console.log('💾 Saving push token to Firestore for user:', userId);
     await setDoc(
       doc(db, 'users', userId),
-      { pushToken: tokenData.data },
+      { 
+        pushToken: newToken,
+        pushTokenLastRefreshed: Timestamp.now(),
+      },
       { merge: true }
     );
 
+    // Also store last refresh time in AsyncStorage for local checks
+    try {
+      await AsyncStorage.setItem(`pushToken_lastRefresh_${userId}`, Date.now().toString());
+    } catch (error) {
+      console.warn('Failed to save token refresh time to AsyncStorage:', error);
+    }
+
     console.log('✅ Push token registered successfully for user:', userId);
-    return tokenData.data;
+    return newToken;
   } catch (error) {
     console.error('Error registering for push notifications:', error);
     return null;
   }
+}
+
+/**
+ * Check if push token needs to be refreshed based on last refresh time
+ * Tokens should be refreshed:
+ * - If never refreshed before
+ * - If last refresh was more than 24 hours ago
+ * - If forceRefresh is true
+ * @param userId - The user ID to check
+ * @param forceRefresh - Force refresh even if recent
+ * @returns true if token should be refreshed
+ */
+export async function shouldRefreshPushToken(userId: string, forceRefresh: boolean = false): Promise<boolean> {
+  if (forceRefresh) {
+    return true;
+  }
+
+  try {
+    // CRITICAL: Always check Firestore first to see if token exists
+    // If token is null (was cleared by Cloud Function due to invalidity), we MUST refresh
+    const userDocRef = doc(db, 'users', userId);
+    const userDoc = await getDoc(userDocRef);
+    
+    if (userDoc.exists()) {
+      const userData = userDoc.data();
+      const existingToken = userData?.pushToken;
+      
+      // If token is null or missing, we MUST refresh regardless of timestamp
+      if (!existingToken || existingToken === null) {
+        console.log('🔄 Push token is null in Firestore, refresh required');
+        return true;
+      }
+      
+      // Token exists, check if refresh is needed based on timestamp
+      const lastRefreshed = userData?.pushTokenLastRefreshed;
+      
+      if (lastRefreshed) {
+        const lastRefreshedDate = lastRefreshed.toDate ? lastRefreshed.toDate() : new Date(lastRefreshed);
+        const hoursSinceRefresh = (Date.now() - lastRefreshedDate.getTime()) / (1000 * 60 * 60);
+        
+        // Refresh if last refresh was more than 24 hours ago
+        if (hoursSinceRefresh < 24) {
+          console.log(`✅ Push token refreshed ${hoursSinceRefresh.toFixed(1)} hours ago in Firestore, skipping refresh`);
+          return false;
+        }
+      }
+    }
+
+    // Also check AsyncStorage for quick local check (but Firestore is authoritative)
+    // Only use AsyncStorage if Firestore check didn't give us a definitive answer
+    const lastRefreshKey = `pushToken_lastRefresh_${userId}`;
+    const lastRefreshTimeStr = await AsyncStorage.getItem(lastRefreshKey);
+    
+    if (lastRefreshTimeStr) {
+      const lastRefreshTime = parseInt(lastRefreshTimeStr, 10);
+      const hoursSinceRefresh = (Date.now() - lastRefreshTime) / (1000 * 60 * 60);
+      
+      // Only skip refresh if AsyncStorage says it was recent AND we don't have Firestore data
+      if (hoursSinceRefresh < 24 && (!userDoc.exists() || !userDoc.data()?.pushTokenLastRefreshed)) {
+        console.log(`✅ Push token refreshed ${hoursSinceRefresh.toFixed(1)} hours ago (AsyncStorage), skipping refresh`);
+        return false;
+      }
+    }
+
+    // If no timestamp found or it's been more than 24 hours, refresh
+    console.log('🔄 Push token refresh needed (no recent refresh found or >24 hours old)');
+    return true;
+  } catch (error) {
+    console.warn('Error checking push token refresh status, will refresh to be safe:', error);
+    return true; // Refresh if we can't determine status
+  }
+}
+
+/**
+ * Refresh push token if needed (checks last refresh time first)
+ * @param userId - The user ID to refresh token for
+ * @returns The push token string, or null if refresh failed or wasn't needed
+ */
+export async function refreshPushTokenIfNeeded(userId: string): Promise<string | null> {
+  const needsRefresh = await shouldRefreshPushToken(userId);
+  
+  if (!needsRefresh) {
+    // Token is fresh, just return existing token from Firestore
+    try {
+      const userDocRef = doc(db, 'users', userId);
+      const userDoc = await getDoc(userDocRef);
+      
+      if (userDoc.exists()) {
+        const existingToken = userDoc.data()?.pushToken;
+        if (existingToken) {
+          return existingToken;
+        }
+      }
+    } catch (error) {
+      console.warn('Error getting existing token, proceeding with refresh:', error);
+    }
+    
+    // If we can't get existing token, proceed with refresh
+    return await registerForPushNotifications(userId, false);
+  }
+  
+  return await registerForPushNotifications(userId, false);
 }
 
 /**
@@ -307,5 +454,43 @@ export function createMessageDeepLink(messageId: string, message: string, fromUs
     params.append('isGroupMessage', 'true');
   }
   return Linking.createURL(`/message-view?${params.toString()}`);
+}
+
+/**
+ * Set up AppState listener to refresh push tokens when app comes to foreground
+ * This ensures tokens are always fresh, especially after long periods of inactivity
+ * @param userId - The user ID to refresh tokens for
+ * @returns Cleanup function to remove the listener
+ */
+export function setupPushTokenRefreshOnAppState(userId: string): () => void {
+  let appStateSubscription: any = null;
+  let isRefreshing = false; // Prevent concurrent refreshes
+
+  const handleAppStateChange = async (nextAppState: AppStateStatus) => {
+    if (nextAppState === 'active' && !isRefreshing) {
+      // App came to foreground - refresh token if needed
+      isRefreshing = true;
+      console.log('📱 App came to foreground, checking push token refresh...');
+      
+      try {
+        await refreshPushTokenIfNeeded(userId);
+      } catch (error) {
+        console.error('Error refreshing push token on app state change:', error);
+      } finally {
+        isRefreshing = false;
+      }
+    }
+  };
+
+  // Subscribe to app state changes
+  appStateSubscription = AppState.addEventListener('change', handleAppStateChange);
+
+  // Return cleanup function
+  return () => {
+    if (appStateSubscription) {
+      appStateSubscription.remove();
+      appStateSubscription = null;
+    }
+  };
 }
 

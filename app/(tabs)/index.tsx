@@ -14,7 +14,7 @@ import { useColorScheme } from '@/hooks/use-color-scheme';
 import { collection, query, where, getDocs, doc, getDoc, addDoc, updateDoc, increment, Timestamp, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { db } from '@/config/firebase';
 import * as Notifications from 'expo-notifications';
-import { registerForPushNotifications } from '@/services/notifications';
+import { refreshPushTokenIfNeeded } from '@/services/notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { IconSymbol } from '@/components/ui/icon-symbol';
 import { Friend, Group } from '@/types';
@@ -230,17 +230,20 @@ export default function HomeScreen() {
 
   useEffect(() => {
     loadFriendsAndGroups();
-    // Register for push notifications - ONLY for authenticated users
-    const registerPushToken = async () => {
-      // CRITICAL: Only register if we have a valid authenticated user
+    // Refresh push token if needed - ONLY for authenticated users
+    // Note: _layout.tsx also handles token refresh, but this ensures token is checked
+    // when this screen loads (e.g., after navigation). The smart refresh function
+    // will skip if token was recently refreshed to avoid unnecessary refreshes.
+    const refreshPushToken = async () => {
+      // CRITICAL: Only refresh if we have a valid authenticated user
       if (user?.uid) {
-        console.log('📱 Registering push token for authenticated user:', user.uid);
-        await registerForPushNotifications(user.uid);
+        console.log('📱 Checking push token refresh for authenticated user:', user.uid);
+        await refreshPushTokenIfNeeded(user.uid);
       } else {
-        console.log('⚠️ Skipping push token registration: No authenticated user');
+        console.log('⚠️ Skipping push token refresh: No authenticated user');
       }
     };
-    registerPushToken();
+    refreshPushToken();
   }, [user]);
 
   // Refresh groups and friends when screen comes into focus

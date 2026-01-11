@@ -117,6 +117,43 @@ async function checkReceiptAndUpdateStatus(
         const errorDetails = (receipt as any).details || {};
         logger.warn(`Notification delivery failed (receipt: ${receiptId}): ${errorMessage}`, errorDetails);
         
+        // CRITICAL: Check if error is due to invalid/expired token
+        // Common Expo errors for invalid tokens:
+        // - "DeviceNotRegistered" - token is invalid/expired
+        // - "InvalidCredentials" - token format is invalid
+        // - "MessageTooBig" - not a token issue, but handled below
+        // - "MessageRateExceeded" - not a token issue, but handled below
+        const isTokenError = 
+          errorMessage.includes("DeviceNotRegistered") ||
+          errorMessage.includes("InvalidCredentials") ||
+          errorMessage.includes("NotRegistered") ||
+          errorMessage.includes("InvalidRegistrationToken") ||
+          (errorDetails as any)?.error === "DeviceNotRegistered";
+        
+        if (isTokenError) {
+          // Get the notification data to find the recipient user ID
+          const currentDoc = await notificationDocRef.get();
+          const notificationData = currentDoc.data();
+          const toUserId = notificationData?.toUserId;
+          
+          if (toUserId) {
+            logger.warn(`Invalid/expired push token detected for user ${toUserId}. Clearing token from Firestore.`);
+            
+            try {
+              // Clear the invalid token from user's document
+              // This will force the app to refresh the token on next app open
+              const userDocRef = admin.firestore().collection("users").doc(toUserId);
+              await userDocRef.update({
+                pushToken: null,
+                pushTokenLastRefreshed: null,
+              });
+              logger.info(`Cleared invalid push token for user ${toUserId}`);
+            } catch (clearError) {
+              logger.error(`Error clearing invalid push token for user ${toUserId}:`, clearError);
+            }
+          }
+        }
+        
         // Only update if status is still "sent" (avoid race conditions)
         const currentDoc = await notificationDocRef.get();
         const currentData = currentDoc.data();

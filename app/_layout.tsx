@@ -6,7 +6,7 @@ import 'react-native-reanimated';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
-import { setupNotificationListeners, registerForPushNotifications } from '@/services/notifications';
+import { setupNotificationListeners, refreshPushTokenIfNeeded, setupPushTokenRefreshOnAppState } from '@/services/notifications';
 import { startMessageCleanup } from '@/services/messageCleanup';
 
 export const unstable_settings = {
@@ -28,16 +28,21 @@ function RootLayoutNav() {
     const currentUserId = user.uid;
     console.log('🔔 Setting up notification listeners for user:', currentUserId);
 
-    // CRITICAL: Register push token immediately when app opens (if user is authenticated)
-    // This ensures tokens are always fresh and available, even if user hasn't opened app in a while
-    // Tokens are stored in Firestore and persist, but we refresh them to ensure they're valid
-    registerForPushNotifications(currentUserId).catch((error) => {
-      console.error('Error registering push token on app open:', error);
-      // Don't block app if token registration fails
+    // CRITICAL: Refresh push token intelligently when app opens
+    // This function checks if token needs refresh (e.g., >24 hours old) before refreshing
+    // This ensures tokens are always fresh and prevents unnecessary refreshes
+    refreshPushTokenIfNeeded(currentUserId).catch((error) => {
+      console.error('Error refreshing push token on app open:', error);
+      // Don't block app if token refresh fails
     });
 
+    // CRITICAL: Set up AppState listener to refresh tokens when app comes to foreground
+    // This ensures tokens stay fresh even if app was closed for a long time
+    // Tokens are refreshed automatically when user opens the app after inactivity
+    const cleanupAppStateListener = setupPushTokenRefreshOnAppState(currentUserId);
+
     // Set up notification listeners with user validation
-    const cleanup = setupNotificationListeners((messageId, message, fromUsername, fromUserId, fromDisplayName, groupId, groupName, isGroupMessage) => {
+    const cleanupNotificationListeners = setupNotificationListeners((messageId, message, fromUsername, fromUserId, fromDisplayName, groupId, groupName, isGroupMessage) => {
       // CRITICAL: Verify this notification is FROM another user TO the current user
       // Notifications should be FROM other users, not from the current user
       if (!fromUserId || fromUserId === currentUserId) {
@@ -69,9 +74,12 @@ function RootLayoutNav() {
 
     // Cleanup listeners on unmount or when user changes
     return () => {
-      console.log('🧹 Cleaning up notification listeners');
-      if (cleanup) {
-        cleanup();
+      console.log('🧹 Cleaning up notification listeners and AppState listener');
+      if (cleanupNotificationListeners) {
+        cleanupNotificationListeners();
+      }
+      if (cleanupAppStateListener) {
+        cleanupAppStateListener();
       }
     };
   }, [router, user?.uid]); // Re-setup when user changes
