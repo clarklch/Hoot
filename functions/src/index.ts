@@ -4,7 +4,7 @@
  */
 
 import {setGlobalOptions} from "firebase-functions";
-import {onDocumentCreated} from "firebase-functions/v2/firestore";
+import {onDocumentCreated, onDocumentUpdated} from "firebase-functions/v2/firestore";
 import {onSchedule} from "firebase-functions/v2/scheduler";
 import * as admin from "firebase-admin";
 import {Expo} from "expo-server-sdk";
@@ -243,14 +243,56 @@ export const sendHootNotification = onDocumentCreated(
       const recipientData = recipientDoc.data();
       pushToken = recipientData?.pushToken || null;
       
-      if (!pushToken || !Expo.isExpoPushToken(pushToken)) {
-        logger.info(`No valid push token for user ${toUserId}. User may not have registered for notifications yet.`);
+      // Enhanced logging to diagnose token issues
+      if (!pushToken) {
+        logger.warn(`No push token found for user ${toUserId}. pushToken field: ${typeof recipientData?.pushToken}, value: ${JSON.stringify(recipientData?.pushToken)}`);
+        logger.warn(`User document exists: ${recipientDoc.exists}, has pushTokenLastRefreshed: ${!!recipientData?.pushTokenLastRefreshed}`);
+        // CRITICAL: Mark as "pending" instead of "failed" when token is missing
+        // This allows retry when user refreshes their token (guarantees delivery)
         await notificationDocRef.update({
-          status: "failed",
-          failureReason: "No valid push token",
+          status: "pending",
+          waitingForToken: true, // Flag to identify notifications waiting for token refresh
+          failureReason: "No valid push token - token not registered, will retry when token is refreshed",
+          pendingSince: admin.firestore.FieldValue.serverTimestamp(),
         });
+        logger.info(`⏳ Notification ${notificationId} marked as pending - will retry when user ${toUserId} refreshes push token`);
         return;
       }
+      
+      // Type guard: ensure pushToken is a string before checking format
+      // Type guard: ensure pushToken is a string
+      if (typeof pushToken !== 'string') {
+        logger.warn(`Invalid push token type for user ${toUserId}. Expected string, got ${typeof pushToken}`);
+        // Mark as pending to allow retry when valid token is registered
+        await notificationDocRef.update({
+          status: "pending",
+          waitingForToken: true,
+          failureReason: "No valid push token - invalid type, will retry when token is refreshed",
+          pendingSince: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        logger.info(`⏳ Notification ${notificationId} marked as pending - invalid token type, will retry when user ${toUserId} refreshes push token`);
+        return;
+      }
+      
+      // Validate token format
+      const isValidToken = Expo.isExpoPushToken(pushToken);
+      if (!isValidToken) {
+        const tokenPreview = pushToken.length > 20 ? pushToken.substring(0, 20) : pushToken;
+        logger.warn(`Invalid push token format for user ${toUserId}. Token: ${tokenPreview}...`);
+        // Mark as pending to allow retry when valid token is registered
+        await notificationDocRef.update({
+          status: "pending",
+          waitingForToken: true,
+          failureReason: "No valid push token - invalid format, will retry when token is refreshed",
+          pendingSince: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        logger.info(`⏳ Notification ${notificationId} marked as pending - invalid token format, will retry when user ${toUserId} refreshes push token`);
+        return;
+      }
+      
+      // Token is valid - log success
+      const tokenPreview = pushToken.length > 20 ? pushToken.substring(0, 20) : pushToken;
+      logger.info(`✅ Valid push token found for user ${toUserId}. Token: ${tokenPreview}...`);
     } catch (error) {
       logger.error(`Error fetching push token for user ${toUserId}:`, error);
       await notificationDocRef.update({
@@ -434,6 +476,206 @@ export const sendHootNotification = onDocumentCreated(
         failureReason: error?.message || "Unknown error",
         sentAt: admin.firestore.FieldValue.serverTimestamp(),
       });
+    }
+  }
+);
+
+// Helper function to retry a pending notification (used when push token is refreshed)
+async function retryPendingNotification(
+  notificationDocRef: admin.firestore.DocumentReference,
+  pushToken: string
+): Promise<void> {
+  try {
+    const notificationDoc = await notificationDocRef.get();
+    if (!notificationDoc.exists) {
+      logger.warn(`Notification ${notificationDocRef.id} does not exist, skipping retry`);
+      return;
+    }
+
+    const notification = notificationDoc.data();
+    if (!notification) {
+      logger.warn(`Notification ${notificationDocRef.id} has no data, skipping retry`);
+      return;
+    }
+
+    // Only retry if status is "pending" and waitingForToken is true
+    if (notification.status !== "pending" || !notification.waitingForToken) {
+      logger.info(`Notification ${notificationDocRef.id} is not pending (status: ${notification.status}), skipping retry`);
+      return;
+    }
+
+    const messageId = notification.messageId;
+    const fromUserId = notification.fromUserId;
+    const toUserId = notification.toUserId;
+    const fromDisplayName = notification.fromDisplayName;
+    const isGroupMessage = notification.isGroupMessage || false;
+    const groupName = notification.groupName || null;
+
+    if (!toUserId || !pushToken) {
+      logger.warn(`Invalid notification data for ${notificationDocRef.id}, skipping retry`);
+      return;
+    }
+
+    // Get sender's display name (prefer fromDisplayName, fallback to fetching from user doc)
+    let displayName = fromDisplayName;
+    if (!displayName && fromUserId) {
+      try {
+        const senderDoc = await admin.firestore()
+          .collection("users")
+          .doc(fromUserId)
+          .get();
+        const senderData = senderDoc.data();
+        displayName = senderData?.displayName || senderData?.username || "Someone";
+      } catch (error) {
+        logger.warn("Error fetching sender display name for retry:", error);
+        displayName = notification.fromUsername || "Someone";
+      }
+    }
+
+    // Create notification title based on whether it's from a group or individual
+    let notificationTitle: string;
+    if (isGroupMessage && groupName) {
+      notificationTitle = `Hoot from ${groupName} - ${displayName}`;
+    } else {
+      notificationTitle = `Hoot from ${displayName}`;
+    }
+
+    // Create notification message
+    const message = {
+      to: pushToken,
+      sound: "default" as const,
+      title: notificationTitle,
+      body: notification.message || "Hoot!",
+      priority: "high" as const,
+      _contentAvailable: true,
+      data: {
+        type: "hoot",
+        messageId: messageId,
+        message: notification.message,
+        fromUserId: notification.fromUserId,
+        fromUsername: notification.fromUsername,
+        fromDisplayName: displayName,
+        groupId: notification.groupId || null,
+        groupName: groupName,
+        isGroupMessage: isGroupMessage,
+      },
+    };
+
+    // Send notification with retry logic
+    try {
+      const tickets = await retryWithBackoff(
+        () => expo.sendPushNotificationsAsync([message]),
+        3,
+        1000
+      );
+
+      if (!tickets || tickets.length === 0) {
+        throw new Error("No tickets returned from Expo push service");
+      }
+
+      const ticket = tickets[0];
+
+      if ('id' in ticket && ticket.id) {
+        const receiptId = ticket.id as string;
+
+        // Update notification document with status and receipt ID
+        await notificationDocRef.update({
+          status: "sent",
+          receiptId: receiptId,
+          waitingForToken: admin.firestore.FieldValue.delete(), // Remove waiting flag
+          pendingSince: admin.firestore.FieldValue.delete(), // Remove pending timestamp
+          retriedAt: admin.firestore.FieldValue.serverTimestamp(),
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        logger.info(`✅ Pending notification ${notificationDocRef.id} retried successfully (receiptId: ${receiptId})`);
+
+        // Check receipt asynchronously
+        checkReceiptAndUpdateStatus(notificationDocRef, receiptId).catch((error) => {
+          logger.error(`Error in receipt check for ${receiptId}:`, error);
+        });
+      } else {
+        // Ticket indicates an error during send
+        const errorMessage = ('message' in ticket ? ticket.message : 'Unknown error') || 'Unknown error';
+        logger.error(`Notification retry failed immediately for ${notificationDocRef.id}: ${errorMessage}`);
+
+        await notificationDocRef.update({
+          status: "failed",
+          failureReason: errorMessage,
+          waitingForToken: admin.firestore.FieldValue.delete(),
+          pendingSince: admin.firestore.FieldValue.delete(),
+          retriedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    } catch (error: any) {
+      logger.error(`Failed to retry pending notification ${notificationDocRef.id} after retries:`, error);
+
+      await notificationDocRef.update({
+        status: "failed",
+        failureReason: error?.message || "Unknown error",
+        waitingForToken: admin.firestore.FieldValue.delete(),
+        pendingSince: admin.firestore.FieldValue.delete(),
+        retriedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+  } catch (error) {
+    logger.error(`Error in retryPendingNotification for ${notificationDocRef.id}:`, error);
+  }
+}
+
+// CRITICAL: Retry pending notifications when a user's push token is refreshed
+// This ensures notifications are delivered when user opens app after token expiration
+export const retryPendingNotificationsOnTokenRefresh = onDocumentUpdated(
+  "users/{userId}",
+  async (event) => {
+    const beforeData = event.data?.before.data();
+    const afterData = event.data?.after.data();
+    const userId = event.params.userId;
+
+    if (!beforeData || !afterData) {
+      logger.warn(`No data for user ${userId} update, skipping retry check`);
+      return;
+    }
+
+    // Check if push token was just set (changed from null/undefined to a value)
+    const beforeToken = beforeData?.pushToken || null;
+    const afterToken = afterData?.pushToken || null;
+
+    // Only retry if token was just set (not cleared)
+    if (!afterToken || afterToken === beforeToken) {
+      // Token unchanged or cleared, no need to retry
+      return;
+    }
+
+    // Token was just set, find all pending notifications waiting for this user's token
+    logger.info(`🔄 Push token refreshed for user ${userId}, checking for pending notifications to retry...`);
+
+    try {
+      const pendingNotificationsQuery = admin.firestore()
+        .collection("notifications")
+        .where("toUserId", "==", userId)
+        .where("status", "==", "pending")
+        .where("waitingForToken", "==", true);
+
+      const pendingSnapshot = await pendingNotificationsQuery.get();
+
+      if (pendingSnapshot.empty) {
+        logger.info(`No pending notifications found for user ${userId}`);
+        return;
+      }
+
+      logger.info(`Found ${pendingSnapshot.size} pending notifications for user ${userId}, retrying...`);
+
+      // Retry all pending notifications with the new token
+      const retryPromises = pendingSnapshot.docs.map((doc) => {
+        return retryPendingNotification(doc.ref, afterToken);
+      });
+
+      await Promise.all(retryPromises);
+
+      logger.info(`✅ Retry completed for ${pendingSnapshot.size} pending notifications for user ${userId}`);
+    } catch (error) {
+      logger.error(`Error retrying pending notifications for user ${userId}:`, error);
     }
   }
 );

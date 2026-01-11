@@ -5,13 +5,14 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { isFriendMuted, isGroupMuted } from '@/utils/muteHelpers';
+import { validateStreak } from '@/utils/streakHelpers';
 import React from 'react';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { useAuth } from '@/contexts/AuthContext';
 import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { collection, query, where, getDocs, doc, getDoc, addDoc, updateDoc, increment, Timestamp, writeBatch, serverTimestamp } from 'firebase/firestore';
+import { collection, query, where, getDocs, doc, getDoc, addDoc, updateDoc, increment, Timestamp, writeBatch, serverTimestamp, onSnapshot, Unsubscribe } from 'firebase/firestore';
 import { db } from '@/config/firebase';
 import * as Notifications from 'expo-notifications';
 import { refreshPushTokenIfNeeded } from '@/services/notifications';
@@ -140,6 +141,7 @@ export default function HomeScreen() {
   const [favoriteOrder, setFavoriteOrder] = useState<string[]>([]);
   const [favoriteGroupOrder, setFavoriteGroupOrder] = useState<string[]>([]);
   const [favoritesMode, setFavoritesMode] = useState<'friends' | 'groups'>('friends');
+  const notificationListenersRef = useRef<Map<string, Unsubscribe>>(new Map());
   const scrollViewRef = useRef<ScrollView>(null);
   const searchInputRef = useRef<TextInput>(null);
   const hootEmojiOpacity = useRef(new Animated.Value(1)).current;
@@ -244,6 +246,14 @@ export default function HomeScreen() {
       }
     };
     refreshPushToken();
+
+    // Cleanup notification listeners on unmount
+    return () => {
+      notificationListenersRef.current.forEach((unsubscribe) => {
+        unsubscribe();
+      });
+      notificationListenersRef.current.clear();
+    };
   }, [user]);
 
   // Refresh groups and friends when screen comes into focus
@@ -295,6 +305,10 @@ export default function HomeScreen() {
           const data = docSnap.data();
           const friendDoc = await getDoc(doc(db, 'users', data.friendId));
           const friendData = friendDoc.data();
+          const lastHootDate = data.lastHootDate || null;
+          const rawStreakCount = data.streakCount || 0;
+          // Validate streak: reset to 0 if more than 1 day has passed
+          const validatedStreakCount = validateStreak(rawStreakCount, lastHootDate);
           return {
             id: docSnap.id,
             friendId: data.friendId,
@@ -302,8 +316,8 @@ export default function HomeScreen() {
             friendDisplayName: friendData?.displayName,
             isFavorite: data.isFavorite || false,
             mutedUntil: data.mutedUntil ? data.mutedUntil.toDate() : null,
-            streakCount: data.streakCount || 0,
-            lastHootDate: data.lastHootDate || null,
+            streakCount: validatedStreakCount,
+            lastHootDate: lastHootDate,
           };
         })
       );
@@ -318,12 +332,16 @@ export default function HomeScreen() {
       const groupsSnapshot = await getDocs(groupsQuery);
       const groupsList = groupsSnapshot.docs.map(doc => {
         const data = doc.data();
+        const lastHootDate = data.lastHootDate || null;
+        const rawStreakCount = data.streakCount || 0;
+        // Validate streak: reset to 0 if more than 1 day has passed
+        const validatedStreakCount = validateStreak(rawStreakCount, lastHootDate);
         return {
           id: doc.id,
           name: data.name,
           memberIds: data.memberIds || [],
-          streakCount: data.streakCount || 0,
-          lastHootDate: data.lastHootDate || null,
+          streakCount: validatedStreakCount,
+          lastHootDate: lastHootDate,
           isFavorite: data.isFavorite || false,
         };
       }) as Group[];
@@ -352,6 +370,8 @@ export default function HomeScreen() {
       console.error('Error loading friends and groups:', error);
     }
   };
+
+
 
   const animateHootEmoji = () => {
     // Generate random angle only for top half of button (not bottom)
@@ -595,7 +615,9 @@ export default function HomeScreen() {
             // Commit batch atomically
             await batch.commit();
 
-            return { messageId: messageId, recipientId, pushToken };
+            const notificationId = notificationDocRef.id;
+
+            return { messageId: messageId, recipientId, pushToken, notificationId };
           });
 
           allMessagePromises.push(...messagePromises);
@@ -681,7 +703,9 @@ export default function HomeScreen() {
           // Commit batch atomically
           await batch.commit();
 
-          return { messageId: messageId, recipientId, pushToken };
+          const notificationId = notificationDocRef.id;
+
+          return { messageId: messageId, recipientId, pushToken, notificationId };
         });
 
         await Promise.all(messagePromises);
@@ -842,7 +866,8 @@ export default function HomeScreen() {
         console.error('Error updating fun stats:', error);
       }
 
-      setHootText(defaultHootText);
+      // Don't reset hootText after sending - keep user's text for next message
+      // Text will only reset when app relaunches (handled in loadFriendsAndGroups)
     } catch (error) {
       console.error('Error sending Hoot:', error);
       Alert.alert('Error', 'Failed to send Hoot. Please try again.');

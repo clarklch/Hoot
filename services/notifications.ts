@@ -42,7 +42,8 @@ export async function registerForPushNotifications(userId: string, forceRefresh:
     }
     
     if (finalStatus !== 'granted') {
-      console.log('Failed to get push token for push notification!');
+      console.error(`❌ Push notification permissions not granted for user ${userId}. Status: ${finalStatus}`);
+      console.error('💡 User needs to grant notification permissions in device settings');
       return null;
     }
 
@@ -184,10 +185,11 @@ export async function registerForPushNotifications(userId: string, forceRefresh:
       console.warn('Failed to save token refresh time to AsyncStorage:', error);
     }
 
-    console.log('✅ Push token registered successfully for user:', userId);
+    console.log('✅ Push token registered successfully for user:', userId, 'Token:', newToken.substring(0, 20) + '...');
     return newToken;
   } catch (error) {
-    console.error('Error registering for push notifications:', error);
+    console.error(`❌ Error registering for push notifications for user ${userId}:`, error);
+    console.error('Error details:', error instanceof Error ? error.message : JSON.stringify(error));
     return null;
   }
 }
@@ -269,6 +271,7 @@ export async function shouldRefreshPushToken(userId: string, forceRefresh: boole
  * @returns The push token string, or null if refresh failed or wasn't needed
  */
 export async function refreshPushTokenIfNeeded(userId: string): Promise<string | null> {
+  console.log(`🔄 refreshPushTokenIfNeeded called for user: ${userId}`);
   const needsRefresh = await shouldRefreshPushToken(userId);
   
   if (!needsRefresh) {
@@ -280,17 +283,26 @@ export async function refreshPushTokenIfNeeded(userId: string): Promise<string |
       if (userDoc.exists()) {
         const existingToken = userDoc.data()?.pushToken;
         if (existingToken) {
+          console.log(`✅ Existing token found for user ${userId}, skipping refresh`);
           return existingToken;
+        } else {
+          console.warn(`⚠️ No existing token found for user ${userId} (needsRefresh=false but token is null), forcing refresh`);
+          // Token should exist but doesn't - force refresh
+          return await registerForPushNotifications(userId, true);
         }
+      } else {
+        console.warn(`⚠️ User document doesn't exist for user ${userId}, forcing refresh`);
+        return await registerForPushNotifications(userId, true);
       }
     } catch (error) {
-      console.warn('Error getting existing token, proceeding with refresh:', error);
+      console.error('❌ Error getting existing token, proceeding with refresh:', error);
     }
     
     // If we can't get existing token, proceed with refresh
     return await registerForPushNotifications(userId, false);
   }
   
+  console.log(`🔄 Token refresh needed for user ${userId}, registering now...`);
   return await registerForPushNotifications(userId, false);
 }
 

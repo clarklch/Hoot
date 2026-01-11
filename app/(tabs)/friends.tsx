@@ -29,6 +29,7 @@ import { checkForAllMissedMessages as checkMissedMessagesUtil } from '@/utils/mi
 import { isFriendMuted, isGroupMuted, getMuteStatusText, getGroupMuteStatusText } from '@/utils/muteHelpers';
 import { getCurrentUserId as getCurrentUserIdUtil } from '@/utils/authHelpers';
 import { fuzzyMatch } from '@/utils/searchHelpers';
+import { validateStreak } from '@/utils/streakHelpers';
 import { MuteModal } from '@/components/MuteModal';
 import { FriendItem } from '@/components/FriendItem';
 import { IconSymbol } from '@/components/ui/icon-symbol';
@@ -412,7 +413,7 @@ export default function FriendsScreen() {
             isIncoming: false,
             isFavorite: data.isFavorite || false,
             mutedUntil: data.mutedUntil ? data.mutedUntil.toDate() : null,
-            streakCount: data.streakCount || 0,
+            streakCount: validateStreak(data.streakCount || 0, data.lastHootDate || null),
             lastHootDate: data.lastHootDate || null,
           };
         })
@@ -512,7 +513,7 @@ export default function FriendsScreen() {
           createdBy: data.createdBy,
           createdAt: data.createdAt ? data.createdAt.toDate() : undefined,
           isFavorite: data.isFavorite || false,
-          streakCount: data.streakCount || 0,
+          streakCount: validateStreak(data.streakCount || 0, data.lastHootDate || null),
           lastHootDate: data.lastHootDate || null,
         };
       }) as Group[];
