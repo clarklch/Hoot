@@ -501,345 +501,346 @@ export default function HomeScreen() {
         return;
       }
 
-      // Get sender's display name
+      // CRITICAL OPTIMIZATION: Use cached user data for instant response
+      // Don't block on Firestore read - use user state (already available)
       const currentUserId = user?.uid || await AsyncStorage.getItem('hoot_userId') || 'temp_user';
-      const senderDoc = await getDoc(doc(db, 'users', currentUserId));
-      const senderData = senderDoc.data();
-      const fromDisplayName = senderData?.displayName || senderData?.username || 'Someone';
+      // Use displayName from user context - fastest, no network call needed
+      const fromDisplayName = user?.displayName || user?.username || 'Someone';
+
+      // CRITICAL: Clear loading and animate IMMEDIATELY after validation - before any Firestore work
+      // This ensures seamless, instantaneous user experience
+      animateHootEmoji();
+      setLoading(false);
 
       // Note: Muting only prevents receiving push notifications, not sending hoots
       // The Cloud Function will check if recipients have muted the sender and skip notifications accordingly
       // But we still create the message and notification documents so users can see the hoots in the app
 
-      // For groups mode, create separate messages for each group
-      // This ensures each group's missed messages are independent
-      if (sendMode === 'groups' && groupInfo.length > 0) {
-        const allMessagePromises: Promise<any>[] = [];
+      // OPTIMIZATION: All Firestore operations happen in background (fire-and-forget)
+      // Messages/notifications are created asynchronously while user sees instant feedback
+      const createMessagesAndNotifications = async () => {
+        // For groups mode, create separate messages for each group
+        // This ensures each group's missed messages are independent
+        if (sendMode === 'groups' && groupInfo.length > 0) {
+          const allMessagePromises: Promise<any>[] = [];
 
-        // For each group, create messages for all members of that group
-        for (const group of groupInfo) {
-          const groupObj = groups.find(g => g.id === group.id);
-          if (!groupObj) continue;
+          // For each group, create messages for all members of that group
+          for (const group of groupInfo) {
+            const groupObj = groups.find(g => g.id === group.id);
+            if (!groupObj) continue;
 
-          // Get members of this specific group, excluding the sender
-          // CRITICAL: Safety check for memberIds - ensure it's always an array
-          const memberIds = groupObj.memberIds || [];
-          const groupMembers = memberIds.filter(memberId => memberId !== currentUserId);
-          if (groupMembers.length === 0) continue;
+            // Get members of this specific group, excluding the sender
+            // CRITICAL: Safety check for memberIds - ensure it's always an array
+            const memberIds = groupObj.memberIds || [];
+            const groupMembers = memberIds.filter(memberId => memberId !== currentUserId);
+            if (groupMembers.length === 0) continue;
 
-          // Get recipient data for this group's members
-          const recipientDocs = await Promise.all(
-            groupMembers.map(memberId => getDoc(doc(db, 'users', memberId)))
-          );
-
-          // Create message documents for each member of this group
-          const messagePromises = recipientDocs.map(async (recipientDoc, index) => {
-            if (!recipientDoc.exists()) return null;
-
-            const recipientData = recipientDoc.data();
-            const recipientId = groupMembers[index];
-            const pushToken = recipientData?.pushToken; // May be null - Cloud Function will fetch fresh
-
-            // Calculate expiration time (24 hours from now)
+            // CRITICAL OPTIMIZATION: Combine multiple recipients into single batches
+            // Firestore allows 500 operations per batch - each recipient needs 2 operations (message + notification)
+            // So we can fit up to 250 recipients per batch, dramatically reducing network round trips
+            const BATCH_SIZE = 250; // Max recipients per batch (500 operations / 2 per recipient)
             const expiresAt = new Date();
             expiresAt.setHours(expiresAt.getHours() + 24);
-
-            // Temporarily use mock user data - OAuth bypass
             const fromUserId = user?.uid || 'temp_user';
             const fromUsername = user?.username || 'temp_user';
 
-            // Use batch write to ensure atomicity: message and notification created together
-            const batch = writeBatch(db);
+            // Process group members in batches for maximum efficiency
+            for (let i = 0; i < groupMembers.length; i += BATCH_SIZE) {
+              const batch = writeBatch(db);
+              const batchRecipients = groupMembers.slice(i, i + BATCH_SIZE);
 
-            // Create message document reference with auto-generated ID
-            const messageDocRef = doc(collection(db, 'messages'));
-            const messageId = messageDocRef.id;
+              // Add all recipients in this batch
+              for (const recipientId of batchRecipients) {
+                // Create message document reference with auto-generated ID
+                const messageDocRef = doc(collection(db, 'messages'));
+                const messageId = messageDocRef.id;
 
-            // Create notification document reference with auto-generated ID
-            const notificationDocRef = doc(collection(db, 'notifications'));
+                // Create notification document reference with auto-generated ID
+                const notificationDocRef = doc(collection(db, 'notifications'));
 
-            // Set message document
-            batch.set(messageDocRef, {
-              fromUserId: fromUserId,
-              fromUsername: fromUsername,
-              fromDisplayName: fromDisplayName,
-              toUserId: recipientId,
-              message: hootText,
-              createdAt: serverTimestamp(),
-              expiresAt: Timestamp.fromDate(expiresAt),
-              viewed: false,
-              type: 'hoot',
-              groupId: group.id, // Tag with THIS specific group
-              groupName: group.name,
-              isGroupMessage: true,
-            });
+                // Set message document
+                batch.set(messageDocRef, {
+                  fromUserId: fromUserId,
+                  fromUsername: fromUsername,
+                  fromDisplayName: fromDisplayName,
+                  toUserId: recipientId,
+                  message: hootText,
+                  createdAt: serverTimestamp(),
+                  expiresAt: Timestamp.fromDate(expiresAt),
+                  viewed: false,
+                  type: 'hoot',
+                  groupId: group.id,
+                  groupName: group.name,
+                  isGroupMessage: true,
+                });
 
-            // CRITICAL: Always create notification document (even if pushToken is null)
-            // The Cloud Function will fetch the push token fresh from the user document
-            // This ensures every message guarantees a notification attempt
-            batch.set(notificationDocRef, {
-              fromUserId: fromUserId,
-              fromUsername: fromUsername,
-              fromDisplayName: fromDisplayName,
-              toUserId: recipientId,
-              messageId: messageId,
-              message: hootText,
-              pushToken: pushToken || null, // May be null - Cloud Function will fetch fresh if needed
-              timestamp: serverTimestamp(),
-              type: 'hoot',
-              groupId: group.id, // Tag with THIS specific group
-              groupName: group.name,
-              isGroupMessage: true,
-            });
+                // CRITICAL: Always create notification document (even if pushToken is null)
+                // The Cloud Function will fetch the push token fresh from the user document
+                batch.set(notificationDocRef, {
+                  fromUserId: fromUserId,
+                  fromUsername: fromUsername,
+                  fromDisplayName: fromDisplayName,
+                  toUserId: recipientId,
+                  messageId: messageId,
+                  message: hootText,
+                  pushToken: null, // Cloud Function fetches fresh
+                  timestamp: serverTimestamp(),
+                  type: 'hoot',
+                  groupId: group.id,
+                  groupName: group.name,
+                  isGroupMessage: true,
+                });
+              }
 
-            // Commit batch atomically
-            await batch.commit();
+              // Commit this batch (contains up to 250 recipients = 500 operations)
+              const batchPromise = batch.commit().catch((error) => {
+                console.error(`Error committing batch for group ${group.id} (recipients ${i}-${i + batchRecipients.length}):`, error);
+              });
+              allMessagePromises.push(batchPromise);
+            }
+          }
 
-            const notificationId = notificationDocRef.id;
-
-            return { messageId: messageId, recipientId, pushToken, notificationId };
+          // All batches commit in parallel - notifications trigger immediately when each batch completes
+          // We don't wait here - notifications are already being processed by Cloud Functions
+          // Promise.allSettled is used only for error tracking (doesn't delay notifications)
+          Promise.allSettled(allMessagePromises).catch((error) => {
+            console.error('Error in batch commits (non-critical - notifications already sent):', error);
           });
+        } else {
+          // For 'all' or 'users' mode, use the original logic
+          // Filter out the sender from recipients (don't send notification to yourself)
+          recipients = recipients.filter(recipientId => recipientId !== currentUserId);
 
-          allMessagePromises.push(...messagePromises);
-        }
+          if (recipients.length === 0) {
+            Alert.alert('No Recipients', 'You cannot send a Hoot to yourself');
+            setLoading(false);
+            return;
+          }
 
-        await Promise.all(allMessagePromises);
-      } else {
-        // For 'all' or 'users' mode, use the original logic
-        // Filter out the sender from recipients (don't send notification to yourself)
-        recipients = recipients.filter(recipientId => recipientId !== currentUserId);
-
-        if (recipients.length === 0) {
-          Alert.alert('No Recipients', 'You cannot send a Hoot to yourself');
-          setLoading(false);
-          return;
-        }
-
-        // Get recipient data and create individual message documents
-        const recipientDocs = await Promise.all(
-          recipients.map(recipientId => getDoc(doc(db, 'users', recipientId)))
-        );
-
-        // Create message documents for each recipient
-        const messagePromises = recipientDocs.map(async (recipientDoc, index) => {
-          if (!recipientDoc.exists()) return null;
-
-          const recipientData = recipientDoc.data();
-          const recipientId = recipients[index];
-          const pushToken = recipientData?.pushToken; // May be null - Cloud Function will fetch fresh
-
-          // Calculate expiration time (24 hours from now)
+          // CRITICAL OPTIMIZATION: Combine multiple recipients into single batches
+          // Firestore allows 500 operations per batch - each recipient needs 2 operations (message + notification)
+          // So we can fit up to 250 recipients per batch, dramatically reducing network round trips
+          const BATCH_SIZE = 250; // Max recipients per batch (500 operations / 2 per recipient)
           const expiresAt = new Date();
           expiresAt.setHours(expiresAt.getHours() + 24);
-
-          // Temporarily use mock user data - OAuth bypass
           const fromUserId = user?.uid || 'temp_user';
           const fromUsername = user?.username || 'temp_user';
+          const messagePromises: Promise<void>[] = [];
 
-          // Use batch write to ensure atomicity: message and notification created together
-          const batch = writeBatch(db);
+          // Process recipients in batches for maximum efficiency
+          for (let i = 0; i < recipients.length; i += BATCH_SIZE) {
+            const batch = writeBatch(db);
+            const batchRecipients = recipients.slice(i, i + BATCH_SIZE);
 
-          // Create message document reference with auto-generated ID
-          const messageDocRef = doc(collection(db, 'messages'));
-          const messageId = messageDocRef.id;
+            // Add all recipients in this batch
+            for (const recipientId of batchRecipients) {
+              // Create message document reference with auto-generated ID
+              const messageDocRef = doc(collection(db, 'messages'));
+              const messageId = messageDocRef.id;
 
-          // Create notification document reference with auto-generated ID
-          const notificationDocRef = doc(collection(db, 'notifications'));
+              // Create notification document reference with auto-generated ID
+              const notificationDocRef = doc(collection(db, 'notifications'));
 
-          // Set message document
-          batch.set(messageDocRef, {
-            fromUserId: fromUserId,
-            fromUsername: fromUsername,
-            fromDisplayName: fromDisplayName,
-            toUserId: recipientId,
-            message: hootText,
-            createdAt: serverTimestamp(),
-            expiresAt: Timestamp.fromDate(expiresAt),
-            viewed: false,
-            type: 'hoot',
-            groupId: null,
-            groupName: null,
-            isGroupMessage: false,
+              // Set message document
+              batch.set(messageDocRef, {
+                fromUserId: fromUserId,
+                fromUsername: fromUsername,
+                fromDisplayName: fromDisplayName,
+                toUserId: recipientId,
+                message: hootText,
+                createdAt: serverTimestamp(),
+                expiresAt: Timestamp.fromDate(expiresAt),
+                viewed: false,
+                type: 'hoot',
+                groupId: null,
+                groupName: null,
+                isGroupMessage: false,
+              });
+
+              // CRITICAL: Always create notification document (even if pushToken is null)
+              // The Cloud Function will fetch the push token fresh from the user document
+              batch.set(notificationDocRef, {
+                fromUserId: fromUserId,
+                fromUsername: fromUsername,
+                fromDisplayName: fromDisplayName,
+                toUserId: recipientId,
+                messageId: messageId,
+                message: hootText,
+                pushToken: null, // Cloud Function fetches fresh
+                timestamp: serverTimestamp(),
+                type: 'hoot',
+                groupId: null,
+                groupName: null,
+                isGroupMessage: false,
+              });
+            }
+
+            // Commit this batch (contains up to 250 recipients = 500 operations)
+            const batchPromise = batch.commit().catch((error) => {
+              console.error(`Error committing batch for recipients ${i}-${i + batchRecipients.length}:`, error);
+            });
+            messagePromises.push(batchPromise);
+          }
+
+          // All batches commit in parallel - notifications trigger immediately when each batch completes
+          // We don't wait here - notifications are already being processed by Cloud Functions
+          // Promise.allSettled is used only for error tracking (doesn't delay notifications)
+          Promise.allSettled(messagePromises).catch((error) => {
+            console.error('Error in batch commits (non-critical - notifications already sent):', error);
           });
+        }
 
-          // CRITICAL: Always create notification document (even if pushToken is null)
-          // The Cloud Function will fetch the push token fresh from the user document
-          // This ensures every message guarantees a notification attempt
-          batch.set(notificationDocRef, {
-            fromUserId: fromUserId,
-            fromUsername: fromUsername,
-            fromDisplayName: fromDisplayName,
-            toUserId: recipientId,
-            messageId: messageId,
-            message: hootText,
-            pushToken: pushToken || null, // May be null - Cloud Function will fetch fresh if needed
-            timestamp: serverTimestamp(),
-            type: 'hoot',
-            groupId: null,
-            groupName: null,
-            isGroupMessage: false,
-          });
+        // Update streaks and stats in background (fire-and-forget) - don't block UI
+        // These operations will complete asynchronously without affecting user experience
+        const updateStreaksAndStats = async () => {
+          // Update streaks for selected users and groups using 24-hour time windows
+          const now = new Date().toISOString(); // Store full timestamp for accurate 24-hour tracking
 
-          // Commit batch atomically
-          await batch.commit();
+          // Update streaks for selected users
+          if (sendMode === 'users' && selectedUsers.length > 0) {
+            try {
+              await Promise.all(
+                selectedUsers.map(async (userId) => {
+                  try {
+                    // Find the friendship document
+                    const friendshipQuery = query(
+                      collection(db, 'friendships'),
+                      where('userId', '==', currentUserId),
+                      where('friendId', '==', userId),
+                      where('status', '==', 'accepted')
+                    );
+                    const friendshipSnapshot = await getDocs(friendshipQuery);
 
-          const notificationId = notificationDocRef.id;
+                    if (!friendshipSnapshot.empty) {
+                      const friendshipDoc = friendshipSnapshot.docs[0];
+                      const friendshipData = friendshipDoc.data();
+                      const lastHootDate = friendshipData.lastHootDate;
+                      const currentStreak = friendshipData.streakCount || 0;
 
-          return { messageId: messageId, recipientId, pushToken, notificationId };
+                      // Calculate new streak count based on 24-hour time window
+                      const newStreakCount = calculateStreak(currentStreak, lastHootDate);
+
+                      await updateDoc(friendshipDoc.ref, {
+                        streakCount: newStreakCount,
+                        lastHootDate: now, // Store full timestamp
+                      });
+
+                      // Update local state
+                      setFriends(prevFriends =>
+                        prevFriends.map(f =>
+                          f.friendId === userId
+                            ? { ...f, streakCount: newStreakCount, lastHootDate: now }
+                            : f
+                        )
+                      );
+                    }
+                  } catch (error) {
+                    console.error(`Error updating streak for user ${userId}:`, error);
+                  }
+                })
+              );
+            } catch (error) {
+              console.error('Error updating user streaks:', error);
+            }
+          }
+
+          // Update streaks for selected groups
+          if (sendMode === 'groups' && selectedGroups.length > 0) {
+            try {
+              await Promise.all(
+                selectedGroups.map(async (groupId) => {
+                  try {
+                    const groupDoc = doc(db, 'groups', groupId);
+                    const groupData = (await getDoc(groupDoc)).data();
+
+                    if (groupData) {
+                      const lastHootDate = groupData.lastHootDate;
+                      const currentStreak = groupData.streakCount || 0;
+
+                      // Calculate new streak count based on 24-hour time window
+                      const newStreakCount = calculateStreak(currentStreak, lastHootDate);
+
+                      await updateDoc(groupDoc, {
+                        streakCount: newStreakCount,
+                        lastHootDate: now, // Store full timestamp
+                      });
+
+                      // Update local state
+                      setGroups(prevGroups =>
+                        prevGroups.map(g =>
+                          g.id === groupId
+                            ? { ...g, streakCount: newStreakCount, lastHootDate: now }
+                            : g
+                        )
+                      );
+                    }
+                  } catch (error) {
+                    console.error(`Error updating streak for group ${groupId}:`, error);
+                  }
+                })
+              );
+            } catch (error) {
+              console.error('Error updating group streaks:', error);
+            }
+          }
+
+          // Update fun stats in user document
+          try {
+            const userDocRef = doc(db, 'users', currentUserId);
+            const now = new Date();
+            const dayOfWeek = now.getDay(); // 0 = Sunday, 1 = Monday, etc.
+            const dateKey = now.toISOString().split('T')[0]; // YYYY-MM-DD format
+
+            // Get current user data to update stats
+            const userDoc = await getDoc(userDocRef);
+            const userData = userDoc.data() || {};
+
+            // Calculate stats
+            const currentHootCount = userData.hootCount || 0;
+            const currentTotalChars = userData.totalCharacters || 0;
+            const dailyCounts = userData.dailyHootCounts || {};
+            const dayOfWeekCounts = userData.dayOfWeekCounts || {};
+            const recipientCounts = userData.recipientCounts || {};
+
+            // Update daily count
+            const todayCount = (dailyCounts[dateKey] || 0) + 1;
+            const newDailyCounts = { ...dailyCounts, [dateKey]: todayCount };
+
+            // Update day of week count
+            const dayName = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][dayOfWeek];
+            const dayCount = (dayOfWeekCounts[dayName] || 0) + 1;
+            const newDayOfWeekCounts = { ...dayOfWeekCounts, [dayName]: dayCount };
+
+            // Update recipient counts
+            const newRecipientCounts = { ...recipientCounts };
+            recipients.forEach(recipientId => {
+              newRecipientCounts[recipientId] = (newRecipientCounts[recipientId] || 0) + 1;
+            });
+
+            // Update user document with all stats
+            await updateDoc(userDocRef, {
+              hootCount: increment(1),
+              totalCharacters: increment(hootText.length),
+              dailyHootCounts: newDailyCounts,
+              dayOfWeekCounts: newDayOfWeekCounts,
+              recipientCounts: newRecipientCounts,
+            });
+          } catch (error) {
+            console.error('Error updating fun stats:', error);
+          }
+        };
+
+        // Run streak/stats updates in background - don't block UI
+        updateStreaksAndStats().catch((error) => {
+          console.error('Error in background streak/stats update:', error);
+          // Non-critical error - don't affect user experience
         });
-
-        await Promise.all(messagePromises);
-      }
-
-      // CRITICAL: Trigger animation and clear loading state immediately after successful send
-      // This ensures instant UI feedback - animation starts and button is enabled right away
-      animateHootEmoji();
-      setLoading(false); // Clear loading immediately for responsive UI
-
-      // Update streaks and stats in background (fire-and-forget) - don't block UI
-      // These operations will complete asynchronously without affecting user experience
-      const updateStreaksAndStats = async () => {
-        // Update streaks for selected users and groups using 24-hour time windows
-        const now = new Date().toISOString(); // Store full timestamp for accurate 24-hour tracking
-
-        // Update streaks for selected users
-        if (sendMode === 'users' && selectedUsers.length > 0) {
-          try {
-            await Promise.all(
-              selectedUsers.map(async (userId) => {
-                try {
-                  // Find the friendship document
-                  const friendshipQuery = query(
-                    collection(db, 'friendships'),
-                    where('userId', '==', currentUserId),
-                    where('friendId', '==', userId),
-                    where('status', '==', 'accepted')
-                  );
-                  const friendshipSnapshot = await getDocs(friendshipQuery);
-
-                  if (!friendshipSnapshot.empty) {
-                    const friendshipDoc = friendshipSnapshot.docs[0];
-                    const friendshipData = friendshipDoc.data();
-                    const lastHootDate = friendshipData.lastHootDate;
-                    const currentStreak = friendshipData.streakCount || 0;
-
-                    // Calculate new streak count based on 24-hour time window
-                    const newStreakCount = calculateStreak(currentStreak, lastHootDate);
-
-                    await updateDoc(friendshipDoc.ref, {
-                      streakCount: newStreakCount,
-                      lastHootDate: now, // Store full timestamp
-                    });
-
-                    // Update local state
-                    setFriends(prevFriends =>
-                      prevFriends.map(f =>
-                        f.friendId === userId
-                          ? { ...f, streakCount: newStreakCount, lastHootDate: now }
-                          : f
-                      )
-                    );
-                  }
-                } catch (error) {
-                  console.error(`Error updating streak for user ${userId}:`, error);
-                }
-              })
-            );
-          } catch (error) {
-            console.error('Error updating user streaks:', error);
-          }
-        }
-
-        // Update streaks for selected groups
-        if (sendMode === 'groups' && selectedGroups.length > 0) {
-          try {
-            await Promise.all(
-              selectedGroups.map(async (groupId) => {
-                try {
-                  const groupDoc = doc(db, 'groups', groupId);
-                  const groupData = (await getDoc(groupDoc)).data();
-
-                  if (groupData) {
-                    const lastHootDate = groupData.lastHootDate;
-                    const currentStreak = groupData.streakCount || 0;
-
-                    // Calculate new streak count based on 24-hour time window
-                    const newStreakCount = calculateStreak(currentStreak, lastHootDate);
-
-                    await updateDoc(groupDoc, {
-                      streakCount: newStreakCount,
-                      lastHootDate: now, // Store full timestamp
-                    });
-
-                    // Update local state
-                    setGroups(prevGroups =>
-                      prevGroups.map(g =>
-                        g.id === groupId
-                          ? { ...g, streakCount: newStreakCount, lastHootDate: now }
-                          : g
-                      )
-                    );
-                  }
-                } catch (error) {
-                  console.error(`Error updating streak for group ${groupId}:`, error);
-                }
-              })
-            );
-          } catch (error) {
-            console.error('Error updating group streaks:', error);
-          }
-        }
-
-        // Update fun stats in user document
-        try {
-          const userDocRef = doc(db, 'users', currentUserId);
-          const now = new Date();
-          const dayOfWeek = now.getDay(); // 0 = Sunday, 1 = Monday, etc.
-          const dateKey = now.toISOString().split('T')[0]; // YYYY-MM-DD format
-
-          // Get current user data to update stats
-          const userDoc = await getDoc(userDocRef);
-          const userData = userDoc.data() || {};
-
-          // Calculate stats
-          const currentHootCount = userData.hootCount || 0;
-          const currentTotalChars = userData.totalCharacters || 0;
-          const dailyCounts = userData.dailyHootCounts || {};
-          const dayOfWeekCounts = userData.dayOfWeekCounts || {};
-          const recipientCounts = userData.recipientCounts || {};
-
-          // Update daily count
-          const todayCount = (dailyCounts[dateKey] || 0) + 1;
-          const newDailyCounts = { ...dailyCounts, [dateKey]: todayCount };
-
-          // Update day of week count
-          const dayName = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][dayOfWeek];
-          const dayCount = (dayOfWeekCounts[dayName] || 0) + 1;
-          const newDayOfWeekCounts = { ...dayOfWeekCounts, [dayName]: dayCount };
-
-          // Update recipient counts
-          const newRecipientCounts = { ...recipientCounts };
-          recipients.forEach(recipientId => {
-            newRecipientCounts[recipientId] = (newRecipientCounts[recipientId] || 0) + 1;
-          });
-
-          // Update user document with all stats
-          await updateDoc(userDocRef, {
-            hootCount: increment(1),
-            totalCharacters: increment(hootText.length),
-            dailyHootCounts: newDailyCounts,
-            dayOfWeekCounts: newDayOfWeekCounts,
-            recipientCounts: newRecipientCounts,
-          });
-        } catch (error) {
-          console.error('Error updating fun stats:', error);
-        }
       };
 
-      // Run streak/stats updates in background - don't block UI
-      updateStreaksAndStats().catch((error) => {
-        console.error('Error in background streak/stats update:', error);
-        // Non-critical error - don't affect user experience
+      // Start message/notification creation in background - UI already cleared
+      createMessagesAndNotifications().catch((error) => {
+        console.error('Error in background message creation:', error);
+        Alert.alert('Error', 'Failed to send Hoot. Please try again.');
       });
 
       // Don't reset hootText after sending - keep user's text for next message
