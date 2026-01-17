@@ -691,144 +691,163 @@ export default function HomeScreen() {
         await Promise.all(messagePromises);
       }
 
-      // Trigger hoot emoji animation only after successful send
+      // CRITICAL: Trigger animation and clear loading state immediately after successful send
+      // This ensures instant UI feedback - animation starts and button is enabled right away
       animateHootEmoji();
+      setLoading(false); // Clear loading immediately for responsive UI
 
-      // Update streaks for selected users and groups using 24-hour time windows
-      const now = new Date().toISOString(); // Store full timestamp for accurate 24-hour tracking
+      // Update streaks and stats in background (fire-and-forget) - don't block UI
+      // These operations will complete asynchronously without affecting user experience
+      const updateStreaksAndStats = async () => {
+        // Update streaks for selected users and groups using 24-hour time windows
+        const now = new Date().toISOString(); // Store full timestamp for accurate 24-hour tracking
 
-      // Update streaks for selected users
-      if (sendMode === 'users' && selectedUsers.length > 0) {
-        await Promise.all(
-          selectedUsers.map(async (userId) => {
-            try {
-              // Find the friendship document
-              const friendshipQuery = query(
-                collection(db, 'friendships'),
-                where('userId', '==', currentUserId),
-                where('friendId', '==', userId),
-                where('status', '==', 'accepted')
-              );
-              const friendshipSnapshot = await getDocs(friendshipQuery);
+        // Update streaks for selected users
+        if (sendMode === 'users' && selectedUsers.length > 0) {
+          try {
+            await Promise.all(
+              selectedUsers.map(async (userId) => {
+                try {
+                  // Find the friendship document
+                  const friendshipQuery = query(
+                    collection(db, 'friendships'),
+                    where('userId', '==', currentUserId),
+                    where('friendId', '==', userId),
+                    where('status', '==', 'accepted')
+                  );
+                  const friendshipSnapshot = await getDocs(friendshipQuery);
 
-              if (!friendshipSnapshot.empty) {
-                const friendshipDoc = friendshipSnapshot.docs[0];
-                const friendshipData = friendshipDoc.data();
-                const lastHootDate = friendshipData.lastHootDate;
-                const currentStreak = friendshipData.streakCount || 0;
+                  if (!friendshipSnapshot.empty) {
+                    const friendshipDoc = friendshipSnapshot.docs[0];
+                    const friendshipData = friendshipDoc.data();
+                    const lastHootDate = friendshipData.lastHootDate;
+                    const currentStreak = friendshipData.streakCount || 0;
 
-                // Calculate new streak count based on 24-hour time window
-                const newStreakCount = calculateStreak(currentStreak, lastHootDate);
+                    // Calculate new streak count based on 24-hour time window
+                    const newStreakCount = calculateStreak(currentStreak, lastHootDate);
 
-                await updateDoc(friendshipDoc.ref, {
-                  streakCount: newStreakCount,
-                  lastHootDate: now, // Store full timestamp
-                });
+                    await updateDoc(friendshipDoc.ref, {
+                      streakCount: newStreakCount,
+                      lastHootDate: now, // Store full timestamp
+                    });
 
-                // Update local state
-                setFriends(prevFriends =>
-                  prevFriends.map(f =>
-                    f.friendId === userId
-                      ? { ...f, streakCount: newStreakCount, lastHootDate: now }
-                      : f
-                  )
-                );
-              }
-            } catch (error) {
-              console.error(`Error updating streak for user ${userId}:`, error);
-            }
-          })
-        );
-      }
+                    // Update local state
+                    setFriends(prevFriends =>
+                      prevFriends.map(f =>
+                        f.friendId === userId
+                          ? { ...f, streakCount: newStreakCount, lastHootDate: now }
+                          : f
+                      )
+                    );
+                  }
+                } catch (error) {
+                  console.error(`Error updating streak for user ${userId}:`, error);
+                }
+              })
+            );
+          } catch (error) {
+            console.error('Error updating user streaks:', error);
+          }
+        }
 
-      // Update streaks for selected groups
-      if (sendMode === 'groups' && selectedGroups.length > 0) {
-        await Promise.all(
-          selectedGroups.map(async (groupId) => {
-            try {
-              const groupDoc = doc(db, 'groups', groupId);
-              const groupData = (await getDoc(groupDoc)).data();
+        // Update streaks for selected groups
+        if (sendMode === 'groups' && selectedGroups.length > 0) {
+          try {
+            await Promise.all(
+              selectedGroups.map(async (groupId) => {
+                try {
+                  const groupDoc = doc(db, 'groups', groupId);
+                  const groupData = (await getDoc(groupDoc)).data();
 
-              if (groupData) {
-                const lastHootDate = groupData.lastHootDate;
-                const currentStreak = groupData.streakCount || 0;
+                  if (groupData) {
+                    const lastHootDate = groupData.lastHootDate;
+                    const currentStreak = groupData.streakCount || 0;
 
-                // Calculate new streak count based on 24-hour time window
-                const newStreakCount = calculateStreak(currentStreak, lastHootDate);
+                    // Calculate new streak count based on 24-hour time window
+                    const newStreakCount = calculateStreak(currentStreak, lastHootDate);
 
-                await updateDoc(groupDoc, {
-                  streakCount: newStreakCount,
-                  lastHootDate: now, // Store full timestamp
-                });
+                    await updateDoc(groupDoc, {
+                      streakCount: newStreakCount,
+                      lastHootDate: now, // Store full timestamp
+                    });
 
-                // Update local state
-                setGroups(prevGroups =>
-                  prevGroups.map(g =>
-                    g.id === groupId
-                      ? { ...g, streakCount: newStreakCount, lastHootDate: now }
-                      : g
-                  )
-                );
-              }
-            } catch (error) {
-              console.error(`Error updating streak for group ${groupId}:`, error);
-            }
-          })
-        );
-      }
+                    // Update local state
+                    setGroups(prevGroups =>
+                      prevGroups.map(g =>
+                        g.id === groupId
+                          ? { ...g, streakCount: newStreakCount, lastHootDate: now }
+                          : g
+                      )
+                    );
+                  }
+                } catch (error) {
+                  console.error(`Error updating streak for group ${groupId}:`, error);
+                }
+              })
+            );
+          } catch (error) {
+            console.error('Error updating group streaks:', error);
+          }
+        }
 
-      // Update fun stats in user document
-      try {
-        const userDocRef = doc(db, 'users', currentUserId);
-        const now = new Date();
-        const dayOfWeek = now.getDay(); // 0 = Sunday, 1 = Monday, etc.
-        const dateKey = now.toISOString().split('T')[0]; // YYYY-MM-DD format
+        // Update fun stats in user document
+        try {
+          const userDocRef = doc(db, 'users', currentUserId);
+          const now = new Date();
+          const dayOfWeek = now.getDay(); // 0 = Sunday, 1 = Monday, etc.
+          const dateKey = now.toISOString().split('T')[0]; // YYYY-MM-DD format
 
-        // Get current user data to update stats
-        const userDoc = await getDoc(userDocRef);
-        const userData = userDoc.data() || {};
+          // Get current user data to update stats
+          const userDoc = await getDoc(userDocRef);
+          const userData = userDoc.data() || {};
 
-        // Calculate stats
-        const currentHootCount = userData.hootCount || 0;
-        const currentTotalChars = userData.totalCharacters || 0;
-        const dailyCounts = userData.dailyHootCounts || {};
-        const dayOfWeekCounts = userData.dayOfWeekCounts || {};
-        const recipientCounts = userData.recipientCounts || {};
+          // Calculate stats
+          const currentHootCount = userData.hootCount || 0;
+          const currentTotalChars = userData.totalCharacters || 0;
+          const dailyCounts = userData.dailyHootCounts || {};
+          const dayOfWeekCounts = userData.dayOfWeekCounts || {};
+          const recipientCounts = userData.recipientCounts || {};
 
-        // Update daily count
-        const todayCount = (dailyCounts[dateKey] || 0) + 1;
-        const newDailyCounts = { ...dailyCounts, [dateKey]: todayCount };
+          // Update daily count
+          const todayCount = (dailyCounts[dateKey] || 0) + 1;
+          const newDailyCounts = { ...dailyCounts, [dateKey]: todayCount };
 
-        // Update day of week count
-        const dayName = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][dayOfWeek];
-        const dayCount = (dayOfWeekCounts[dayName] || 0) + 1;
-        const newDayOfWeekCounts = { ...dayOfWeekCounts, [dayName]: dayCount };
+          // Update day of week count
+          const dayName = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][dayOfWeek];
+          const dayCount = (dayOfWeekCounts[dayName] || 0) + 1;
+          const newDayOfWeekCounts = { ...dayOfWeekCounts, [dayName]: dayCount };
 
-        // Update recipient counts
-        const newRecipientCounts = { ...recipientCounts };
-        recipients.forEach(recipientId => {
-          newRecipientCounts[recipientId] = (newRecipientCounts[recipientId] || 0) + 1;
-        });
+          // Update recipient counts
+          const newRecipientCounts = { ...recipientCounts };
+          recipients.forEach(recipientId => {
+            newRecipientCounts[recipientId] = (newRecipientCounts[recipientId] || 0) + 1;
+          });
 
-        // Update user document with all stats
-        await updateDoc(userDocRef, {
-          hootCount: increment(1),
-          totalCharacters: increment(hootText.length),
-          dailyHootCounts: newDailyCounts,
-          dayOfWeekCounts: newDayOfWeekCounts,
-          recipientCounts: newRecipientCounts,
-        });
-      } catch (error) {
-        console.error('Error updating fun stats:', error);
-      }
+          // Update user document with all stats
+          await updateDoc(userDocRef, {
+            hootCount: increment(1),
+            totalCharacters: increment(hootText.length),
+            dailyHootCounts: newDailyCounts,
+            dayOfWeekCounts: newDayOfWeekCounts,
+            recipientCounts: newRecipientCounts,
+          });
+        } catch (error) {
+          console.error('Error updating fun stats:', error);
+        }
+      };
+
+      // Run streak/stats updates in background - don't block UI
+      updateStreaksAndStats().catch((error) => {
+        console.error('Error in background streak/stats update:', error);
+        // Non-critical error - don't affect user experience
+      });
 
       // Don't reset hootText after sending - keep user's text for next message
       // Text will only reset when app relaunches (handled in loadFriendsAndGroups)
     } catch (error) {
       console.error('Error sending Hoot:', error);
       Alert.alert('Error', 'Failed to send Hoot. Please try again.');
-    } finally {
-      setLoading(false);
+      setLoading(false); // Clear loading on error
     }
   };
 
