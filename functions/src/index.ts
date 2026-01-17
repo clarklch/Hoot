@@ -15,7 +15,11 @@ admin.initializeApp();
 const expo = new Expo();
 
 // Set global options for all functions
-setGlobalOptions({maxInstances: 10});
+// CRITICAL: maxInstances limits concurrency to prevent cost overruns
+// Note: minInstances and region are set per-function (v2 functions require function-level config)
+setGlobalOptions({
+  maxInstances: 10,
+});
 
 // Helper function to retry with exponential backoff
 async function retryWithBackoff<T>(
@@ -202,8 +206,14 @@ async function checkReceiptAndUpdateStatus(
 }
 
 // Send Hoot notifications when a notification document is created
+// OPTIMIZED: minInstances keeps function warm to prevent cold starts (instant delivery)
+// region matches Firestore location for lowest latency
 export const sendHootNotification = onDocumentCreated(
-  "notifications/{notificationId}",
+  {
+    document: "notifications/{notificationId}",
+    minInstances: 1, // Keep warm to eliminate cold starts for instant notifications
+    region: "us-central1", // Match Firestore region for lowest latency
+  },
   async (event) => {
     const notificationDocRef = event.data?.ref;
     const notification = event.data?.data();
@@ -237,15 +247,47 @@ export const sendHootNotification = onDocumentCreated(
       return;
     }
     
+    // OPTIMIZATION: Parallelize token fetch, mute checks, and sender name fetch for minimum latency
+    // This reduces sequential waits and enables faster notification delivery
+    const isGroupMessage = notification.isGroupMessage || false;
+    const groupId = notification.groupId || null;
+    
+    // Start all parallel operations immediately
+    const [recipientDocPromise, friendshipMutePromise, groupMutePromise, senderDocPromise] = await Promise.allSettled([
+      // 1. Fetch recipient push token
+      admin.firestore().collection("users").doc(toUserId).get(),
+      // 2. Check friendship mute (only if not group message)
+      !isGroupMessage && toUserId && fromUserId
+        ? admin.firestore()
+            .collection("friendships")
+            .where("userId", "==", toUserId)
+            .where("friendId", "==", fromUserId)
+            .where("status", "==", "accepted")
+            .limit(1)
+            .get()
+        : Promise.resolve(null),
+      // 3. Check group mute (only if group message)
+      isGroupMessage && groupId && toUserId
+        ? admin.firestore()
+            .collection("groupMutes")
+            .where("userId", "==", toUserId)
+            .where("groupId", "==", groupId)
+            .limit(1)
+            .get()
+        : Promise.resolve(null),
+      // 4. Fetch sender display name (only if not provided)
+      !notification.fromDisplayName && notification.fromUserId
+        ? admin.firestore().collection("users").doc(notification.fromUserId).get()
+        : Promise.resolve(null),
+    ]);
+
     // CRITICAL: Always fetch push token fresh from user document
     // This ensures we get the most up-to-date token, even if it was null when notification was created
     // This is the key to guaranteeing notifications - we don't rely on stale client-provided tokens
     let pushToken: string | null = null;
-    try {
-      const recipientDoc = await admin.firestore()
-        .collection("users")
-        .doc(toUserId)
-        .get();
+    
+    if (recipientDocPromise.status === 'fulfilled' && recipientDocPromise.value) {
+      const recipientDoc = recipientDocPromise.value;
       
       if (!recipientDoc.exists) {
         logger.warn(`Recipient user ${toUserId} does not exist, skipping notification`);
@@ -276,10 +318,8 @@ export const sendHootNotification = onDocumentCreated(
       }
       
       // Type guard: ensure pushToken is a string before checking format
-      // Type guard: ensure pushToken is a string
       if (typeof pushToken !== 'string') {
         logger.warn(`Invalid push token type for user ${toUserId}. Expected string, got ${typeof pushToken}`);
-        // Mark as pending to allow retry when valid token is registered
         await notificationDocRef.update({
           status: "pending",
           waitingForToken: true,
@@ -295,7 +335,6 @@ export const sendHootNotification = onDocumentCreated(
       if (!isValidToken) {
         const tokenPreview = pushToken.length > 20 ? pushToken.substring(0, 20) : pushToken;
         logger.warn(`Invalid push token format for user ${toUserId}. Token: ${tokenPreview}...`);
-        // Mark as pending to allow retry when valid token is registered
         await notificationDocRef.update({
           status: "pending",
           waitingForToken: true,
@@ -306,103 +345,67 @@ export const sendHootNotification = onDocumentCreated(
         return;
       }
       
-      // Token is valid - log success
       const tokenPreview = pushToken.length > 20 ? pushToken.substring(0, 20) : pushToken;
       logger.info(`✅ Valid push token found for user ${toUserId}. Token: ${tokenPreview}...`);
-    } catch (error) {
-      logger.error(`Error fetching push token for user ${toUserId}:`, error);
+    } else {
+      logger.error(`Error fetching recipient document for user ${toUserId}:`, recipientDocPromise.status === 'rejected' ? recipientDocPromise.reason : 'Unknown error');
       await notificationDocRef.update({
         status: "failed",
-        failureReason: `Error fetching push token: ${error}`,
+        failureReason: "Error fetching recipient user document",
       });
       return;
     }
     
-    // Check if recipient has muted the sender
-    // When User A mutes User B, the friendship document is: userId=A, friendId=B, mutedUntil=date
-    // When User B sends to User A, we check: userId=A, friendId=B to see if A muted B
-    if (toUserId && fromUserId) {
-      try {
-        const friendshipQuery = admin.firestore()
-          .collection("friendships")
-          .where("userId", "==", toUserId)
-          .where("friendId", "==", fromUserId)
-          .where("status", "==", "accepted")
-          .limit(1);
+    // Check mutes using parallel results (already fetched above)
+    const now = new Date();
+    
+    // Check friendship mute (non-group messages only)
+    if (!isGroupMessage && friendshipMutePromise.status === 'fulfilled' && friendshipMutePromise.value) {
+      const friendshipSnapshot = friendshipMutePromise.value;
+      if (!friendshipSnapshot.empty) {
+        const friendshipData = friendshipSnapshot.docs[0].data();
+        const mutedUntil = friendshipData.mutedUntil;
         
-        const friendshipSnapshot = await friendshipQuery.get();
-        
-        if (!friendshipSnapshot.empty) {
-          const friendshipData = friendshipSnapshot.docs[0].data();
-          const mutedUntil = friendshipData.mutedUntil;
-          
-          if (mutedUntil) {
-            const mutedUntilDate = mutedUntil.toDate ? mutedUntil.toDate() : new Date(mutedUntil);
-            const now = new Date();
-            
-            // If mute hasn't expired, don't send notification
-            if (mutedUntilDate > now) {
-              logger.info(`Skipping notification: Recipient ${toUserId} has muted sender ${fromUserId} until ${mutedUntilDate}`);
-              return;
-            }
+        if (mutedUntil) {
+          const mutedUntilDate = mutedUntil.toDate ? mutedUntil.toDate() : new Date(mutedUntil);
+          if (mutedUntilDate > now) {
+            logger.info(`Skipping notification: Recipient ${toUserId} has muted sender ${fromUserId} until ${mutedUntilDate}`);
+            return;
           }
         }
-      } catch (error) {
-        logger.warn("Error checking mute status in Cloud Function:", error);
-        // Continue with sending notification if mute check fails (fail open)
       }
     }
     
-    // Check for group mutes (if this is a group message)
-    if (notification.isGroupMessage && notification.groupId && toUserId) {
-      try {
-        const groupMuteQuery = admin.firestore()
-          .collection("groupMutes")
-          .where("userId", "==", toUserId)
-          .where("groupId", "==", notification.groupId)
-          .limit(1);
+    // Check group mute (group messages only)
+    if (isGroupMessage && groupMutePromise.status === 'fulfilled' && groupMutePromise.value) {
+      const groupMuteSnapshot = groupMutePromise.value;
+      if (!groupMuteSnapshot.empty) {
+        const groupMuteData = groupMuteSnapshot.docs[0].data();
+        const mutedUntil = groupMuteData.mutedUntil;
         
-        const groupMuteSnapshot = await groupMuteQuery.get();
-        
-        if (!groupMuteSnapshot.empty) {
-          const groupMuteData = groupMuteSnapshot.docs[0].data();
-          const mutedUntil = groupMuteData.mutedUntil;
-          
-          if (mutedUntil) {
-            const mutedUntilDate = mutedUntil.toDate ? mutedUntil.toDate() : new Date(mutedUntil);
-            const now = new Date();
-            
-            // If mute hasn't expired, don't send notification
-            if (mutedUntilDate > now) {
-              logger.info(`Skipping notification: Recipient ${toUserId} has muted group ${notification.groupId} until ${mutedUntilDate}`);
-              return;
-            }
+        if (mutedUntil) {
+          const mutedUntilDate = mutedUntil.toDate ? mutedUntil.toDate() : new Date(mutedUntil);
+          if (mutedUntilDate > now) {
+            logger.info(`Skipping notification: Recipient ${toUserId} has muted group ${groupId} until ${mutedUntilDate}`);
+            return;
           }
         }
-      } catch (error) {
-        logger.warn("Error checking group mute status in Cloud Function:", error);
-        // Continue with sending notification if mute check fails (fail open)
       }
     }
     
-    // Get sender's display name (prefer fromDisplayName, fallback to fetching from user doc)
+    // Get sender's display name from parallel fetch (or use provided)
     let fromDisplayName = notification.fromDisplayName;
-    if (!fromDisplayName && notification.fromUserId) {
-      try {
-        const senderDoc = await admin.firestore()
-          .collection("users")
-          .doc(notification.fromUserId)
-          .get();
+    if (!fromDisplayName && senderDocPromise.status === 'fulfilled' && senderDocPromise.value) {
+      const senderDoc = senderDocPromise.value;
+      if (senderDoc && senderDoc.exists) {
         const senderData = senderDoc.data();
         fromDisplayName = senderData?.displayName || senderData?.username || "Someone";
-      } catch (error) {
-        logger.warn("Error fetching sender display name:", error);
-        fromDisplayName = notification.fromUsername || "Someone";
       }
     }
+    if (!fromDisplayName) {
+      fromDisplayName = notification.fromUsername || "Someone";
+    }
     
-    // Check if this is a group message
-    const isGroupMessage = notification.isGroupMessage || false;
     const groupName = notification.groupName || null;
     
     // Create notification title based on whether it's from a group or individual
@@ -413,23 +416,23 @@ export const sendHootNotification = onDocumentCreated(
       notificationTitle = `Hoot from ${fromDisplayName}`;
     }
     
-    // Create notification message
+    // Create notification message - OPTIMIZED for real-time delivery
     // CRITICAL: This is a REMOTE push notification via Expo Push Notification Service → APNs → iOS
-    // Remote push notifications with alerts (title/body/sound) WORK when app is fully closed
-    // Requirements for iOS delivery when app is closed:
-    // 1. title + body (alert payload) - REQUIRED - tells iOS to display notification even when app closed
-    // 2. sound - REQUIRED - ensures notification is displayed with sound
-    // 3. priority: 'high' - Ensures immediate delivery via APNs
-    // 4. _contentAvailable: true (Expo format) - Optional - allows iOS to wake app for background data processing
-    // Note: Having title/body/sound means this is a standard alert notification (not silent)
-    // Standard alert notifications are ALWAYS delivered by APNs even when app is terminated
+    // Best practices for instant delivery (Snapchat/NYT/etc. style):
+    // 1. title + body (alert payload) - REQUIRED - ensures iOS displays even when app closed
+    // 2. sound: "default" - REQUIRED - makes notification user-visible and audible
+    // 3. priority: "high" - REQUIRED - APNs prioritizes for immediate delivery
+    // 4. TTL: 0 - Ensures instant delivery when device is online (no queuing)
+    // 5. _contentAvailable: true - Allows iOS to wake app for background processing
+    // Standard alert notifications with high priority are ALWAYS delivered immediately by APNs
     const message = {
       to: pushToken,
       sound: "default" as const,
       title: notificationTitle,
       body: notification.message || "Hoot!",
       priority: "high" as const,
-      _contentAvailable: true, // Expo format - allows iOS to wake app for background processing (optional)
+      ttl: 0, // Zero TTL = immediate delivery when online (no queuing delay)
+      _contentAvailable: true, // Expo format - enables background app wake
       data: {
         type: "hoot",
         messageId: messageId,
@@ -1037,9 +1040,153 @@ export const cleanupDeferredMissedMessages = onSchedule(
   }
 );
 
+// CRITICAL: Update recipient's streak when they receive a message
+// This tracks when a user RECEIVES a hoot (not when they send one)
+// Streaks reset to 0 if 24 hours pass without receiving a hoot
+export const updateRecipientStreak = onDocumentCreated(
+  "messages/{messageId}",
+  async (event) => {
+    const message = event.data?.data();
+    if (!message) {
+      logger.warn("No message data found");
+      return;
+    }
+
+    const fromUserId = message.fromUserId;
+    const toUserId = message.toUserId;
+    const isGroupMessage = message.isGroupMessage || false;
+    const groupId = message.groupId || null;
+
+    if (!fromUserId || !toUserId) {
+      logger.warn("Message missing fromUserId or toUserId, skipping streak update");
+      return;
+    }
+
+    // Don't update streak if user sent to themselves
+    if (fromUserId === toUserId) {
+      return;
+    }
+
+    const db = admin.firestore();
+    const now = admin.firestore.Timestamp.now();
+
+    // Update recipient's friendship document (tracks when they received a hoot FROM the sender)
+    try {
+      // Find the recipient's friendship document (userId = recipient, friendId = sender)
+      const friendshipQuery = db
+        .collection("friendships")
+        .where("userId", "==", toUserId)
+        .where("friendId", "==", fromUserId)
+        .where("status", "==", "accepted")
+        .limit(1);
+
+      const friendshipSnapshot = await friendshipQuery.get();
+
+      if (!friendshipSnapshot.empty) {
+        const friendshipDoc = friendshipSnapshot.docs[0];
+        const friendshipData = friendshipDoc.data();
+        const lastHootDate = friendshipData.lastHootDate;
+        const currentStreak = friendshipData.streakCount || 0;
+
+        // Calculate new streak: increment if within 24 hours, reset to 1 if >24 hours
+        let newStreakCount = 1; // Default to 1 (first hoot or broken streak)
+
+        if (lastHootDate) {
+          let lastDate: Date;
+          // Parse lastHootDate - handle both ISO string and Firestore Timestamp
+          if (lastHootDate.toDate) {
+            lastDate = lastHootDate.toDate();
+          } else if (typeof lastHootDate === 'string') {
+            if (lastHootDate.match(/^\d{4}-\d{2}-\d{2}$/)) {
+              lastDate = new Date(lastHootDate + 'T00:00:00.000Z');
+            } else {
+              lastDate = new Date(lastHootDate);
+            }
+          } else {
+            lastDate = new Date(); // Fallback
+          }
+
+          if (!isNaN(lastDate.getTime())) {
+            const timeDiff = now.toMillis() - lastDate.getTime();
+            const hoursDiff = timeDiff / (1000 * 60 * 60);
+
+            // If within 24 hours, increment streak; otherwise reset to 1
+            if (hoursDiff <= 24) {
+              newStreakCount = (currentStreak || 0) + 1;
+            }
+          }
+        }
+
+        // Update recipient's friendship document with new lastHootDate and streak
+        await friendshipDoc.ref.update({
+          lastHootDate: now.toDate().toISOString(), // Store as ISO string for consistency
+          streakCount: newStreakCount,
+        });
+
+        logger.info(`✅ Updated recipient streak: user ${toUserId} received hoot from ${fromUserId}, streak: ${newStreakCount}`);
+      }
+    } catch (error) {
+      logger.error(`Error updating friendship streak for recipient ${toUserId}:`, error);
+    }
+
+    // Update group streak if this is a group message
+    if (isGroupMessage && groupId) {
+      try {
+        const groupDocRef = db.collection("groups").doc(groupId);
+        const groupDoc = await groupDocRef.get();
+
+        if (groupDoc.exists) {
+          const groupData = groupDoc.data();
+          if (groupData) {
+            const lastHootDate = groupData.lastHootDate;
+            const currentStreak = groupData.streakCount || 0;
+
+            // Calculate new streak: increment if within 24 hours, reset to 1 if >24 hours
+            let newStreakCount = 1;
+
+            if (lastHootDate) {
+              let lastDate: Date;
+              if (lastHootDate.toDate) {
+                lastDate = lastHootDate.toDate();
+              } else if (typeof lastHootDate === 'string') {
+                if (lastHootDate.match(/^\d{4}-\d{2}-\d{2}$/)) {
+                  lastDate = new Date(lastHootDate + 'T00:00:00.000Z');
+                } else {
+                  lastDate = new Date(lastHootDate);
+                }
+              } else {
+                lastDate = new Date();
+              }
+
+              if (!isNaN(lastDate.getTime())) {
+                const timeDiff = now.toMillis() - lastDate.getTime();
+                const hoursDiff = timeDiff / (1000 * 60 * 60);
+
+                if (hoursDiff <= 24) {
+                  newStreakCount = (currentStreak || 0) + 1;
+                }
+              }
+            }
+
+            // Update group document
+            await groupDocRef.update({
+              lastHootDate: now.toDate().toISOString(),
+              streakCount: newStreakCount,
+            });
+
+            logger.info(`✅ Updated group streak: group ${groupId} received hoot, streak: ${newStreakCount}`);
+          }
+        }
+      } catch (error) {
+        logger.error(`Error updating group streak for group ${groupId}:`, error);
+      }
+    }
+  }
+);
+
 // Cleanup #6: Scheduled streak reset for broken streaks
 // Runs hourly to reset streakCount to 0 for friendships and groups where lastHootDate is more than 24 hours ago
-// This ensures Firestore data stays in sync with the client-side validation logic and provides more timely updates
+// This ensures streaks reset when users haven't RECEIVED a hoot in 24+ hours
 export const resetBrokenStreaks = onSchedule(
   {
     schedule: "every 1 hours", // Run hourly
