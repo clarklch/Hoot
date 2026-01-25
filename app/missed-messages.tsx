@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { View, StyleSheet, TouchableOpacity, ScrollView, PanResponder, Dimensions, Alert } from 'react-native';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { View, StyleSheet, TouchableOpacity, ScrollView, Dimensions, Alert } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -10,9 +10,20 @@ import { db } from '@/config/firebase';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { IconSymbol } from '@/components/ui/icon-symbol';
 import { getCurrentUserId } from '@/utils/authHelpers';
+import { GestureDetector, Gesture } from 'react-native-gesture-handler';
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withSpring,
+  withTiming,
+  runOnJS,
+  interpolate,
+  Extrapolation,
+} from 'react-native-reanimated';
 
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
-const SWIPE_THRESHOLD = 150;
+const SWIPE_THRESHOLD = 80; // Reduced threshold for easier dismissal
+const VELOCITY_THRESHOLD = 500; // Also dismiss if velocity is high enough
 
 interface MissedMessage {
   id: string;
@@ -45,10 +56,28 @@ export default function MissedMessagesScreen() {
   const [messages, setMessages] = useState<MissedMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [dismissing, setDismissing] = useState(false);
+  const dismissHandled = useRef(false);
+
+  // Animated values for swipe gesture
+  const translateY = useSharedValue(0);
+  const isDismissing = useSharedValue(false);
+  const shimmerProgress = useSharedValue(0);
 
   useEffect(() => {
     loadMissedMessages();
   }, []);
+
+  // Shimmer animation for swipe prompt
+  useEffect(() => {
+    const animateShimmer = () => {
+      shimmerProgress.value = withTiming(1, { duration: 1500 }, () => {
+        shimmerProgress.value = withTiming(0, { duration: 1500 }, () => {
+          runOnJS(animateShimmer)();
+        });
+      });
+    };
+    animateShimmer();
+  }, [shimmerProgress]);
 
   const loadMissedMessages = async () => {
     try {
@@ -143,9 +172,10 @@ export default function MissedMessagesScreen() {
   };
 
 
-  const handleDismissAll = async () => {
-    if (messages.length === 0 || dismissing) return;
+  const handleDismissAllCallback = useCallback(async () => {
+    if (messages.length === 0 || dismissing || dismissHandled.current) return;
 
+    dismissHandled.current = true;
     setDismissing(true);
     try {
       // Delete all messages from Firestore
@@ -263,22 +293,77 @@ export default function MissedMessagesScreen() {
     }
   };
 
-  const panResponder = PanResponder.create({
-    onStartShouldSetPanResponder: () => false,
-    onMoveShouldSetPanResponder: (_, gestureState) => {
-      // Only respond to downward swipes, and only if it's a significant downward movement
-      // This allows ScrollView to work normally for scrolling up/down
-      return gestureState.dy > 20 && Math.abs(gestureState.dy) > Math.abs(gestureState.dx) * 2;
-    },
-    onPanResponderMove: (_, gestureState) => {
-      // Visual feedback could be added here if needed
-    },
-    onPanResponderRelease: (_, gestureState) => {
-      if (gestureState.dy > SWIPE_THRESHOLD) {
-        // Swipe down to dismiss all
-        handleDismissAll();
+  // Pan gesture for swipe-to-dismiss
+  const panGesture = Gesture.Pan()
+    .onUpdate((event) => {
+      // Only allow downward movement (positive Y)
+      if (event.translationY > 0 && !isDismissing.value) {
+        translateY.value = event.translationY;
       }
-    },
+    })
+    .onEnd((event) => {
+      if (isDismissing.value) return;
+
+      // Dismiss if dragged past threshold OR if velocity is high enough
+      const shouldDismiss =
+        event.translationY > SWIPE_THRESHOLD ||
+        (event.velocityY > VELOCITY_THRESHOLD && event.translationY > 20);
+
+      if (shouldDismiss) {
+        isDismissing.value = true;
+        translateY.value = withTiming(SCREEN_HEIGHT, { duration: 250 }, () => {
+          runOnJS(handleDismissAllCallback)();
+        });
+      } else {
+        // Snap back with spring animation
+        translateY.value = withSpring(0, {
+          damping: 20,
+          stiffness: 300,
+        });
+      }
+    });
+
+  // Animated styles for the main content
+  const animatedContentStyle = useAnimatedStyle(() => {
+    const opacity = interpolate(
+      translateY.value,
+      [0, SCREEN_HEIGHT * 0.3],
+      [1, 0.3],
+      Extrapolation.CLAMP
+    );
+
+    const scale = interpolate(
+      translateY.value,
+      [0, SCREEN_HEIGHT * 0.3],
+      [1, 0.95],
+      Extrapolation.CLAMP
+    );
+
+    return {
+      transform: [
+        { translateY: translateY.value },
+        { scale },
+      ],
+      opacity,
+    };
+  });
+
+  // Shimmer style for the hint
+  const shimmerStyle = useAnimatedStyle(() => {
+    const opacity = interpolate(
+      shimmerProgress.value,
+      [0, 0.5, 1],
+      [0.4, 1, 0.4]
+    );
+    const translateYShimmer = interpolate(
+      shimmerProgress.value,
+      [0, 0.5, 1],
+      [0, -4, 0]
+    );
+    return {
+      opacity,
+      transform: [{ translateY: translateYShimmer }],
+    };
   });
 
   const formatTime = (date: Date): string => {
@@ -319,47 +404,58 @@ export default function MissedMessagesScreen() {
 
   return (
     <ThemedView style={[styles.container, { backgroundColor: colors.background }]}>
-      <View style={[styles.header, { paddingTop: insets.top, borderBottomColor: colors.icon }]}>
-        <ThemedText style={styles.headerTitle}>
-          {messages.length} Missed Message{messages.length !== 1 ? 's' : ''}
-        </ThemedText>
-      </View>
+      <GestureDetector gesture={panGesture}>
+        <Animated.View style={[styles.animatedContainer, animatedContentStyle]}>
+          <View style={[styles.header, { paddingTop: insets.top, borderBottomColor: colors.icon }]}>
+            <ThemedText style={styles.headerTitle}>
+              {messages.length} Missed Message{messages.length !== 1 ? 's' : ''}
+            </ThemedText>
+          </View>
 
-      <ScrollView 
-        style={styles.messagesList} 
-        contentContainerStyle={styles.messagesContent}
-        scrollEnabled={true}
-        nestedScrollEnabled={true}>
-        <View style={[styles.allMessagesCard, { borderColor: colors.icon, backgroundColor: colors.background }]}>
-          {messages.map((msg, index) => (
-            <View key={msg.id} style={styles.messageItem}>
-              <View style={styles.messageHeader}>
-                <ThemedText style={styles.fromText}>
-                  {msg.isGroupMessage && msg.groupName
-                    ? `From: ${msg.groupName} (Group) • ${msg.fromDisplayName || msg.fromUsername || 'Unknown'} (@${msg.fromUsername || 'unknown'})`
-                    : `From: ${msg.fromDisplayName || msg.fromUsername || 'Unknown'}${msg.fromUsername ? ` (@${msg.fromUsername})` : ''}`}
-                </ThemedText>
-                <ThemedText style={styles.timeText}>{formatTime(msg.createdAt)}</ThemedText>
-              </View>
-              <ThemedText style={styles.messageText}>{msg.message}</ThemedText>
-              {index < messages.length - 1 && <View style={[styles.separator, { borderColor: colors.icon }]} />}
+          <ScrollView 
+            style={styles.messagesList} 
+            contentContainerStyle={styles.messagesContent}
+            scrollEnabled={true}
+            nestedScrollEnabled={true}>
+            <View style={[styles.allMessagesCard, { borderColor: colors.icon, backgroundColor: colors.background }]}>
+              {messages.map((msg, index) => (
+                <View key={msg.id} style={styles.messageItem}>
+                  <View style={styles.messageHeader}>
+                    <ThemedText style={styles.fromText}>
+                      {msg.isGroupMessage && msg.groupName
+                        ? `From: ${msg.groupName} (Group) • ${msg.fromDisplayName || msg.fromUsername || 'Unknown'} (@${msg.fromUsername || 'unknown'})`
+                        : `From: ${msg.fromDisplayName || msg.fromUsername || 'Unknown'}${msg.fromUsername ? ` (@${msg.fromUsername})` : ''}`}
+                    </ThemedText>
+                    <ThemedText style={styles.timeText}>{formatTime(msg.createdAt)}</ThemedText>
+                  </View>
+                  <ThemedText style={styles.messageText}>{msg.message}</ThemedText>
+                  {index < messages.length - 1 && <View style={[styles.separator, { borderColor: colors.icon }]} />}
+                </View>
+              ))}
             </View>
-          ))}
-        </View>
-      </ScrollView>
+          </ScrollView>
 
-      <View style={[styles.footer, { paddingBottom: insets.bottom, borderTopColor: colors.icon }]} {...panResponder.panHandlers}>
-        <ThemedText style={styles.swipeHint}>
-          Swipe down to dismiss all messages
-        </ThemedText>
-        <IconSymbol name="chevron.down" size={20} color={colors.icon} />
-      </View>
+          <View style={[styles.footer, { paddingBottom: insets.bottom, borderTopColor: colors.icon }]}>
+            <Animated.View style={shimmerStyle}>
+              <ThemedText style={styles.swipeHint}>
+                Swipe down to dismiss all messages
+              </ThemedText>
+              <View style={styles.swipeIndicator}>
+                <IconSymbol name="chevron.down" size={20} color={colors.icon} />
+              </View>
+            </Animated.View>
+          </View>
+        </Animated.View>
+      </GestureDetector>
     </ThemedView>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
+    flex: 1,
+  },
+  animatedContainer: {
     flex: 1,
   },
   header: {
@@ -460,7 +556,11 @@ const styles = StyleSheet.create({
   swipeHint: {
     fontSize: 14,
     opacity: 0.7,
-    marginBottom: 4,
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  swipeIndicator: {
+    alignItems: 'center',
   },
 });
 

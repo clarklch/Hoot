@@ -29,7 +29,7 @@ import { checkForAllMissedMessages as checkMissedMessagesUtil } from '@/utils/mi
 import { isFriendMuted, isGroupMuted, getMuteStatusText, getGroupMuteStatusText } from '@/utils/muteHelpers';
 import { getCurrentUserId as getCurrentUserIdUtil } from '@/utils/authHelpers';
 import { fuzzyMatch } from '@/utils/searchHelpers';
-import { validateStreak } from '@/utils/streakHelpers';
+import { validateAndSyncStreak } from '@/utils/streakHelpers';
 import { MuteModal } from '@/components/MuteModal';
 import { FriendItem } from '@/components/FriendItem';
 import { IconSymbol } from '@/components/ui/icon-symbol';
@@ -404,6 +404,11 @@ export default function FriendsScreen() {
           const friendDoc = await getDoc(doc(db, 'users', data.friendId));
           const friendData = friendDoc.data();
 
+          const rawStreakCount = data.streakCount || 0;
+          const lastHootDate = data.lastHootDate || null;
+          // Validate streak and sync to Firestore if broken (fire-and-forget)
+          // This ensures the database stays consistent even if the scheduled cleanup hasn't run
+          const validatedStreakCount = validateAndSyncStreak('friendships', docSnap.id, rawStreakCount, lastHootDate);
           return {
             id: docSnap.id,
             friendId: data.friendId,
@@ -413,8 +418,8 @@ export default function FriendsScreen() {
             isIncoming: false,
             isFavorite: data.isFavorite || false,
             mutedUntil: data.mutedUntil ? data.mutedUntil.toDate() : null,
-            streakCount: validateStreak(data.streakCount || 0, data.lastHootDate || null),
-            lastHootDate: data.lastHootDate || null,
+            streakCount: validatedStreakCount,
+            lastHootDate: lastHootDate,
           };
         })
       );
@@ -504,17 +509,22 @@ export default function FriendsScreen() {
         where('memberIds', 'array-contains', currentUserId)
       );
       const snapshot = await getDocs(groupsQuery);
-      const groupsList = snapshot.docs.map(doc => {
-        const data = doc.data();
+      const groupsList = snapshot.docs.map(docSnap => {
+        const data = docSnap.data();
+        const rawStreakCount = data.streakCount || 0;
+        const lastHootDate = data.lastHootDate || null;
+        // Validate streak and sync to Firestore if broken (fire-and-forget)
+        // This ensures the database stays consistent even if the scheduled cleanup hasn't run
+        const validatedStreakCount = validateAndSyncStreak('groups', docSnap.id, rawStreakCount, lastHootDate);
         return {
-          id: doc.id,
+          id: docSnap.id,
           name: data.name,
           memberIds: data.memberIds || [],
           createdBy: data.createdBy,
           createdAt: data.createdAt ? data.createdAt.toDate() : undefined,
           isFavorite: data.isFavorite || false,
-          streakCount: validateStreak(data.streakCount || 0, data.lastHootDate || null),
-          lastHootDate: data.lastHootDate || null,
+          streakCount: validatedStreakCount,
+          lastHootDate: lastHootDate,
         };
       }) as Group[];
 

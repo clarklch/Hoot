@@ -370,6 +370,12 @@ export const sendHootNotification = onDocumentCreated(
           const mutedUntilDate = mutedUntil.toDate ? mutedUntil.toDate() : new Date(mutedUntil);
           if (mutedUntilDate > now) {
             logger.info(`Skipping notification: Recipient ${toUserId} has muted sender ${fromUserId} until ${mutedUntilDate}`);
+            // CRITICAL: Mark as skipped so cleanup function can delete it
+            await notificationDocRef.update({
+              status: "skipped",
+              skipReason: `Recipient muted sender until ${mutedUntilDate.toISOString()}`,
+              skippedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
             return;
           }
         }
@@ -387,6 +393,12 @@ export const sendHootNotification = onDocumentCreated(
           const mutedUntilDate = mutedUntil.toDate ? mutedUntil.toDate() : new Date(mutedUntil);
           if (mutedUntilDate > now) {
             logger.info(`Skipping notification: Recipient ${toUserId} has muted group ${groupId} until ${mutedUntilDate}`);
+            // CRITICAL: Mark as skipped so cleanup function can delete it
+            await notificationDocRef.update({
+              status: "skipped",
+              skipReason: `Recipient muted group until ${mutedUntilDate.toISOString()}`,
+              skippedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
             return;
           }
         }
@@ -407,22 +419,32 @@ export const sendHootNotification = onDocumentCreated(
     }
     
     const groupName = notification.groupName || null;
+    const notificationType = notification.type || "hoot";
     
-    // Create notification title based on whether it's from a group or individual
+    // Create notification title based on notification type and whether it's from a group or individual
     let notificationTitle: string;
-    if (isGroupMessage && groupName) {
+    if (notificationType === "group_deleted") {
+      notificationTitle = "Group Deleted";
+    } else if (notificationType === "member_left") {
+      notificationTitle = "Member Left Group";
+    } else if (notificationType === "member_joined") {
+      notificationTitle = "New Group Member";
+    } else if (isGroupMessage && groupName) {
+      // Hoot from a group
       notificationTitle = `Hoot from ${groupName} - ${fromDisplayName}`;
     } else {
+      // Regular hoot from individual
       notificationTitle = `Hoot from ${fromDisplayName}`;
     }
     
     // Create notification message - OPTIMIZED for real-time delivery
     // CRITICAL: This is a REMOTE push notification via Expo Push Notification Service → APNs → iOS
-    // Best practices for instant delivery (Snapchat/NYT/etc. style):
+    // Best practices for reliable delivery:
     // 1. title + body (alert payload) - REQUIRED - ensures iOS displays even when app closed
     // 2. sound: "default" - REQUIRED - makes notification user-visible and audible
     // 3. priority: "high" - REQUIRED - APNs prioritizes for immediate delivery
-    // 4. TTL: 0 - Ensures instant delivery when device is online (no queuing)
+    // 4. TTL: 86400 (24 hours) - CRITICAL - ensures delivery when device comes online
+    //    NOTE: TTL=0 drops notifications if device is offline! Use 24h for guaranteed delivery
     // 5. _contentAvailable: true - Allows iOS to wake app for background processing
     // Standard alert notifications with high priority are ALWAYS delivered immediately by APNs
     const message = {
@@ -431,7 +453,7 @@ export const sendHootNotification = onDocumentCreated(
       title: notificationTitle,
       body: notification.message || "Hoot!",
       priority: "high" as const,
-      ttl: 0, // Zero TTL = immediate delivery when online (no queuing delay)
+      ttl: 86400, // 24 hours - ensures delivery when device comes online (CRITICAL for offline devices)
       _contentAvailable: true, // Expo format - enables background app wake
       data: {
         type: "hoot",
@@ -573,7 +595,8 @@ async function retryPendingNotification(
     // 1. title + body (alert payload) - REQUIRED - tells iOS to display notification even when app closed
     // 2. sound - REQUIRED - ensures notification is displayed with sound
     // 3. priority: 'high' - Ensures immediate delivery via APNs
-    // 4. _contentAvailable: true (Expo format) - Optional - allows iOS to wake app for background data processing
+    // 4. ttl: 86400 - CRITICAL - ensures delivery when device comes online (24 hours)
+    // 5. _contentAvailable: true (Expo format) - Optional - allows iOS to wake app for background data processing
     // Note: Having title/body/sound means this is a standard alert notification (not silent)
     // Standard alert notifications are ALWAYS delivered by APNs even when app is terminated
     const message = {
@@ -582,6 +605,7 @@ async function retryPendingNotification(
       title: notificationTitle,
       body: notification.message || "Hoot!",
       priority: "high" as const,
+      ttl: 86400, // 24 hours - ensures delivery when device comes online (CRITICAL for offline devices)
       _contentAvailable: true, // Expo format - allows iOS to wake app for background processing (optional)
       data: {
         type: "hoot",
@@ -774,6 +798,7 @@ export const sendFriendRequestNotification = onDocumentCreated(
         title: "New Friend Request",
         body: `${requesterUsername} wants to be your friend`,
         priority: "high" as const,
+        ttl: 86400, // 24 hours - ensures delivery when device comes online
         _contentAvailable: true, // Expo format - allows iOS to wake app for background processing (optional)
         data: {
           type: "friend_request",
@@ -910,9 +935,9 @@ export const cleanupGroupMutes = onSchedule(
 );
 
 // Cleanup #3: Scheduled notification document cleanup
-// Runs every 6 hours to delete old notification documents that have already been sent
-// Notifications are created when sending hoots, and after the Cloud Function sends the push notification,
-// the document is no longer needed. We delete documents older than 1 hour to ensure they've been processed.
+// Runs every 6 hours to delete old notification documents that have been delivered or failed
+// CRITICAL: We only delete "delivered" and "failed" notifications, NOT "pending" ones!
+// Pending notifications are waiting for token refresh and must be preserved for guaranteed delivery
 export const cleanupNotifications = onSchedule(
   {
     schedule: "every 6 hours", // Run every 6 hours
@@ -924,22 +949,63 @@ export const cleanupNotifications = onSchedule(
     const oneHourAgo = admin.firestore.Timestamp.fromMillis(
       Date.now() - 60 * 60 * 1000 // 1 hour ago
     );
+    const sevenDaysAgo = admin.firestore.Timestamp.fromMillis(
+      Date.now() - 7 * 24 * 60 * 60 * 1000 // 7 days ago
+    );
     let deletedCount = 0;
+    let expiredPendingCount = 0;
 
     try {
-      // Query all notification documents older than 1 hour
-      // This ensures they've had time to be processed by the sendHootNotification function
-      const oldNotificationsQuery = db
+      // CRITICAL: Only delete delivered/failed/sent/skipped notifications older than 1 hour
+      // Do NOT delete pending notifications - they are waiting for token refresh
+      // This ensures guaranteed message delivery when user opens the app
+      
+      // Delete delivered notifications older than 1 hour
+      const deliveredQuery = db
         .collection("notifications")
+        .where("status", "==", "delivered")
         .where("timestamp", "<", oneHourAgo);
 
-      const oldSnapshot = await oldNotificationsQuery.get();
-      const oldDocs = oldSnapshot.docs;
+      const deliveredSnapshot = await deliveredQuery.get();
+      
+      // Delete failed notifications older than 1 hour
+      const failedQuery = db
+        .collection("notifications")
+        .where("status", "==", "failed")
+        .where("timestamp", "<", oneHourAgo);
+
+      const failedSnapshot = await failedQuery.get();
+      
+      // Delete sent (but not yet verified) notifications older than 1 hour
+      // These have been handed off to Expo/APNs and don't need to be tracked
+      const sentQuery = db
+        .collection("notifications")
+        .where("status", "==", "sent")
+        .where("timestamp", "<", oneHourAgo);
+
+      const sentSnapshot = await sentQuery.get();
+      
+      // Delete skipped notifications older than 1 hour
+      // These were skipped due to mute settings and don't need to be kept
+      const skippedQuery = db
+        .collection("notifications")
+        .where("status", "==", "skipped")
+        .where("timestamp", "<", oneHourAgo);
+
+      const skippedSnapshot = await skippedQuery.get();
+
+      // Combine all deletable documents
+      const allDocs = [
+        ...deliveredSnapshot.docs,
+        ...failedSnapshot.docs,
+        ...sentSnapshot.docs,
+        ...skippedSnapshot.docs,
+      ];
 
       // Process in batches of 500 (Firestore batch limit)
-      for (let i = 0; i < oldDocs.length; i += 500) {
+      for (let i = 0; i < allDocs.length; i += 500) {
         const batch = db.batch();
-        const batchDocs = oldDocs.slice(i, i + 500);
+        const batchDocs = allDocs.slice(i, i + 500);
 
         batchDocs.forEach((doc) => {
           batch.delete(doc.ref);
@@ -947,10 +1013,32 @@ export const cleanupNotifications = onSchedule(
         });
 
         await batch.commit();
-        logger.info(`Deleted batch of ${batchDocs.length} old notification documents`);
+        logger.info(`Deleted batch of ${batchDocs.length} processed notification documents`);
       }
 
-      logger.info(`Notification cleanup completed: ${deletedCount} old notifications deleted`);
+      // SAFETY: Delete pending notifications older than 7 days (user likely uninstalled app)
+      // This prevents infinite accumulation while still giving users a week to open the app
+      const expiredPendingQuery = db
+        .collection("notifications")
+        .where("status", "==", "pending")
+        .where("timestamp", "<", sevenDaysAgo);
+
+      const expiredPendingSnapshot = await expiredPendingQuery.get();
+      
+      for (let i = 0; i < expiredPendingSnapshot.docs.length; i += 500) {
+        const batch = db.batch();
+        const batchDocs = expiredPendingSnapshot.docs.slice(i, i + 500);
+
+        batchDocs.forEach((doc) => {
+          batch.delete(doc.ref);
+          expiredPendingCount++;
+        });
+
+        await batch.commit();
+        logger.info(`Deleted batch of ${batchDocs.length} expired pending notification documents`);
+      }
+
+      logger.info(`Notification cleanup completed: ${deletedCount} processed notifications deleted, ${expiredPendingCount} expired pending notifications deleted`);
     } catch (error) {
       logger.error("Error during notification cleanup:", error);
       throw error; // Re-throw to mark the function as failed
@@ -1088,8 +1176,11 @@ export const updateRecipientStreak = onDocumentCreated(
         const lastHootDate = friendshipData.lastHootDate;
         const currentStreak = friendshipData.streakCount || 0;
 
-        // Calculate new streak: increment if within 24 hours, reset to 1 if >24 hours
-        let newStreakCount = 1; // Default to 1 (first hoot or broken streak)
+        // Calculate new streak based on consecutive days model:
+        // - Same day (0-24h): keep same streak (no increment)
+        // - Next day (24-48h): increment streak (earned!)
+        // - Streak broken (>48h): reset to 0
+        let newStreakCount = 0; // Default to 0 (first hoot or broken streak)
 
         if (lastHootDate) {
           let lastDate: Date;
@@ -1110,10 +1201,14 @@ export const updateRecipientStreak = onDocumentCreated(
             const timeDiff = now.toMillis() - lastDate.getTime();
             const hoursDiff = timeDiff / (1000 * 60 * 60);
 
-            // If within 24 hours, increment streak; otherwise reset to 1
             if (hoursDiff <= 24) {
+              // Same day hoot - keep current streak (don't increment)
+              newStreakCount = currentStreak || 0;
+            } else if (hoursDiff <= 48) {
+              // Next day hoot (24-48h) - increment streak!
               newStreakCount = (currentStreak || 0) + 1;
             }
+            // If >48 hours, streak is broken, newStreakCount stays at 0
           }
         }
 
@@ -1141,8 +1236,11 @@ export const updateRecipientStreak = onDocumentCreated(
             const lastHootDate = groupData.lastHootDate;
             const currentStreak = groupData.streakCount || 0;
 
-            // Calculate new streak: increment if within 24 hours, reset to 1 if >24 hours
-            let newStreakCount = 1;
+            // Calculate new streak based on consecutive days model:
+            // - Same day (0-24h): keep same streak (no increment)
+            // - Next day (24-48h): increment streak (earned!)
+            // - Streak broken (>48h): reset to 0
+            let newStreakCount = 0;
 
             if (lastHootDate) {
               let lastDate: Date;
@@ -1163,8 +1261,13 @@ export const updateRecipientStreak = onDocumentCreated(
                 const hoursDiff = timeDiff / (1000 * 60 * 60);
 
                 if (hoursDiff <= 24) {
+                  // Same day hoot - keep current streak (don't increment)
+                  newStreakCount = currentStreak || 0;
+                } else if (hoursDiff <= 48) {
+                  // Next day hoot (24-48h) - increment streak!
                   newStreakCount = (currentStreak || 0) + 1;
                 }
+                // If >48 hours, streak is broken, newStreakCount stays at 0
               }
             }
 
@@ -1185,8 +1288,8 @@ export const updateRecipientStreak = onDocumentCreated(
 );
 
 // Cleanup #6: Scheduled streak reset for broken streaks
-// Runs hourly to reset streakCount to 0 for friendships and groups where lastHootDate is more than 24 hours ago
-// This ensures streaks reset when users haven't RECEIVED a hoot in 24+ hours
+// Runs hourly to reset streakCount to 0 for friendships and groups where lastHootDate is more than 48 hours ago
+// Uses consecutive days model: users have until the next day (48h window) to maintain their streak
 export const resetBrokenStreaks = onSchedule(
   {
     schedule: "every 1 hours", // Run hourly
@@ -1212,8 +1315,23 @@ export const resetBrokenStreaks = onSchedule(
         const streakCount = data.streakCount || 0;
         const lastHootDate = data.lastHootDate;
 
-        // Skip if no streak to reset or no lastHootDate
-        if (streakCount === 0 || !lastHootDate) {
+        // Skip if streak is already 0
+        if (streakCount === 0) {
+          continue;
+        }
+
+        // If no lastHootDate but has streak, reset to 0 (edge case from data migration)
+        if (!lastHootDate) {
+          friendshipBatch.update(doc.ref, { streakCount: 0 });
+          friendshipBatchCount++;
+          friendshipResetCount++;
+
+          if (friendshipBatchCount >= 500) {
+            await friendshipBatch.commit();
+            logger.info(`Reset batch of ${friendshipBatchCount} friendship streaks`);
+            friendshipBatchCount = 0;
+            friendshipBatch = db.batch();
+          }
           continue;
         }
 
@@ -1243,8 +1361,9 @@ export const resetBrokenStreaks = onSchedule(
         const timeDiff = now.toMillis() - lastDate.getTime();
         const hoursDiff = timeDiff / (1000 * 60 * 60);
 
-        // If more than 24 hours have passed, reset streak to 0
-        if (hoursDiff > 24) {
+        // If more than 48 hours have passed, reset streak to 0
+        // (Streaks use consecutive days model: users have until the next day to maintain)
+        if (hoursDiff > 48) {
           friendshipBatch.update(doc.ref, { streakCount: 0 });
           friendshipBatchCount++;
           friendshipResetCount++;
@@ -1277,8 +1396,23 @@ export const resetBrokenStreaks = onSchedule(
         const streakCount = data.streakCount || 0;
         const lastHootDate = data.lastHootDate;
 
-        // Skip if no streak to reset or no lastHootDate
-        if (streakCount === 0 || !lastHootDate) {
+        // Skip if streak is already 0
+        if (streakCount === 0) {
+          continue;
+        }
+
+        // If no lastHootDate but has streak, reset to 0 (edge case from data migration)
+        if (!lastHootDate) {
+          groupBatch.update(doc.ref, { streakCount: 0 });
+          groupBatchCount++;
+          groupResetCount++;
+
+          if (groupBatchCount >= 500) {
+            await groupBatch.commit();
+            logger.info(`Reset batch of ${groupBatchCount} group streaks`);
+            groupBatchCount = 0;
+            groupBatch = db.batch();
+          }
           continue;
         }
 
@@ -1308,8 +1442,9 @@ export const resetBrokenStreaks = onSchedule(
         const timeDiff = now.toMillis() - lastDate.getTime();
         const hoursDiff = timeDiff / (1000 * 60 * 60);
 
-        // If more than 24 hours have passed, reset streak to 0
-        if (hoursDiff > 24) {
+        // If more than 48 hours have passed, reset streak to 0
+        // (Streaks use consecutive days model: users have until the next day to maintain)
+        if (hoursDiff > 48) {
           groupBatch.update(doc.ref, { streakCount: 0 });
           groupBatchCount++;
           groupResetCount++;

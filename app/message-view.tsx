@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react';
-import { View, StyleSheet, Animated, Dimensions, PanResponder, TouchableOpacity } from 'react-native';
+import { useEffect, useCallback, useRef } from 'react';
+import { View, StyleSheet, Dimensions } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -8,9 +8,20 @@ import { useColorScheme } from '@/hooks/use-color-scheme';
 import { doc, deleteDoc } from 'firebase/firestore';
 import { db } from '@/config/firebase';
 import { IconSymbol } from '@/components/ui/icon-symbol';
+import { GestureDetector, Gesture } from 'react-native-gesture-handler';
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withSpring,
+  withTiming,
+  runOnJS,
+  interpolate,
+  Extrapolation,
+} from 'react-native-reanimated';
 
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
-const SWIPE_THRESHOLD = 100; // Minimum swipe distance to dismiss
+const SWIPE_THRESHOLD = 80; // Reduced threshold for easier dismissal
+const VELOCITY_THRESHOLD = 500; // Also dismiss if velocity is high enough
 
 export default function MessageViewScreen() {
   const params = useLocalSearchParams();
@@ -27,48 +38,20 @@ export default function MessageViewScreen() {
   const groupName = params.groupName as string;
   const isGroupMessage = params.isGroupMessage === 'true';
 
-  const translateY = useRef(new Animated.Value(0)).current;
-  const opacity = useRef(new Animated.Value(1)).current;
-  const shimmerAnim = useRef(new Animated.Value(0)).current;
+  const translateY = useSharedValue(0);
+  const isDismissing = useSharedValue(false);
+  const shimmerProgress = useSharedValue(0);
+  const dismissHandled = useRef(false);
 
-  const panResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: (_, gestureState) => {
-        // Only respond to downward swipes
-        return gestureState.dy > 10;
-      },
-      onPanResponderMove: (_, gestureState) => {
-        // Only allow downward movement
-        if (gestureState.dy > 0) {
-          translateY.setValue(gestureState.dy);
-          // Fade out as user swipes down
-          const progress = Math.abs(gestureState.dy) / SCREEN_HEIGHT;
-          opacity.setValue(1 - progress);
-        }
-      },
-      onPanResponderRelease: (_, gestureState) => {
-        if (gestureState.dy > SWIPE_THRESHOLD) {
-          // Swipe down detected - dismiss message
-          handleDismiss();
-        } else {
-          // Snap back to original position
-          Animated.parallel([
-            Animated.spring(translateY, {
-              toValue: 0,
-              useNativeDriver: true,
-            }),
-            Animated.spring(opacity, {
-              toValue: 1,
-              useNativeDriver: true,
-            }),
-          ]).start();
-        }
-      },
-    })
-  ).current;
+  const navigateBack = useCallback(() => {
+    router.replace('/(tabs)');
+  }, [router]);
 
-  const handleDismiss = async () => {
+  const handleDismiss = useCallback(async () => {
+    // Prevent multiple dismiss calls
+    if (dismissHandled.current) return;
+    dismissHandled.current = true;
+
     // Delete message immediately when dismissed
     if (messageId) {
       try {
@@ -78,110 +61,136 @@ export default function MessageViewScreen() {
       }
     }
 
-    // Animate out
-    Animated.parallel([
-      Animated.timing(translateY, {
-        toValue: SCREEN_HEIGHT,
-        duration: 300,
-        useNativeDriver: true,
-      }),
-      Animated.timing(opacity, {
-        toValue: 0,
-        duration: 300,
-        useNativeDriver: true,
-      }),
-    ]).start(() => {
-      // Navigate back to home tab after dismissing
-      router.replace('/(tabs)');
-    });
-  };
+    // Navigate back to home tab after dismissing
+    navigateBack();
+  }, [messageId, navigateBack]);
 
-  // Auto-dismiss after viewing (optional - you can remove this if you only want manual dismiss)
-  useEffect(() => {
-    // Message is viewed, mark for deletion
-    // The actual deletion happens when user swipes down
-  }, []);
+  const panGesture = Gesture.Pan()
+    .onUpdate((event) => {
+      // Only allow downward movement (positive Y)
+      if (event.translationY > 0 && !isDismissing.value) {
+        translateY.value = event.translationY;
+      }
+    })
+    .onEnd((event) => {
+      if (isDismissing.value) return;
+
+      // Dismiss if dragged past threshold OR if velocity is high enough
+      const shouldDismiss =
+        event.translationY > SWIPE_THRESHOLD ||
+        (event.velocityY > VELOCITY_THRESHOLD && event.translationY > 20);
+
+      if (shouldDismiss) {
+        isDismissing.value = true;
+        translateY.value = withTiming(SCREEN_HEIGHT, { duration: 250 }, () => {
+          runOnJS(handleDismiss)();
+        });
+      } else {
+        // Snap back with spring animation
+        translateY.value = withSpring(0, {
+          damping: 20,
+          stiffness: 300,
+        });
+      }
+    });
+
+  const animatedContainerStyle = useAnimatedStyle(() => {
+    const opacity = interpolate(
+      translateY.value,
+      [0, SCREEN_HEIGHT * 0.3],
+      [1, 0.3],
+      Extrapolation.CLAMP
+    );
+
+    const scale = interpolate(
+      translateY.value,
+      [0, SCREEN_HEIGHT * 0.3],
+      [1, 0.95],
+      Extrapolation.CLAMP
+    );
+
+    return {
+      transform: [
+        { translateY: translateY.value },
+        { scale },
+      ],
+      opacity,
+    };
+  });
 
   // Shimmer animation for swipe prompt
   useEffect(() => {
-    const shimmer = Animated.loop(
-      Animated.sequence([
-        Animated.timing(shimmerAnim, {
-          toValue: 1,
-          duration: 1500,
-          useNativeDriver: true,
-        }),
-        Animated.timing(shimmerAnim, {
-          toValue: 0,
-          duration: 1500,
-          useNativeDriver: true,
-        }),
-      ])
+    const animateShimmer = () => {
+      shimmerProgress.value = withTiming(1, { duration: 1500 }, () => {
+        shimmerProgress.value = withTiming(0, { duration: 1500 }, () => {
+          runOnJS(animateShimmer)();
+        });
+      });
+    };
+    animateShimmer();
+  }, [shimmerProgress]);
+
+  const shimmerStyle = useAnimatedStyle(() => {
+    const opacity = interpolate(
+      shimmerProgress.value,
+      [0, 0.5, 1],
+      [0.4, 1, 0.4]
     );
-    shimmer.start();
-    return () => shimmer.stop();
-  }, [shimmerAnim]);
+    const translateYShimmer = interpolate(
+      shimmerProgress.value,
+      [0, 0.5, 1],
+      [0, -4, 0]
+    );
+    return {
+      opacity,
+      transform: [{ translateY: translateYShimmer }],
+    };
+  });
 
   return (
     <ThemedView style={styles.container}>
-      <Animated.View
-        style={[
-          styles.messageContainer,
-          {
-            backgroundColor: colors.background,
-            transform: [{ translateY }],
-            opacity,
-          },
-        ]}
-        {...panResponder.panHandlers}>
-        <View style={styles.header}>
-          <ThemedText style={styles.fromText}>
-            {isGroupMessage && groupName ? (
-              <>
-                From: {groupName} (Group)
-                {fromDisplayName && ` • ${fromDisplayName}`}
-                {fromUsername && ` (@${fromUsername})`}
-              </>
-            ) : (
-              <>
-                From: {fromDisplayName || fromUsername || 'Unknown'}
-                {fromUsername && ` (@${fromUsername})`}
-              </>
-            )}
-          </ThemedText>
-        </View>
-
-        <View style={styles.messageContent}>
-          <ThemedText type="title" style={styles.messageText}>
-            {message}
-          </ThemedText>
-        </View>
-
-        <View style={styles.footer}>
-          <Animated.View
-            style={{
-              opacity: shimmerAnim.interpolate({
-                inputRange: [0, 0.5, 1],
-                outputRange: [0.4, 1, 0.4],
-              }),
-              transform: [
-                {
-                  translateY: shimmerAnim.interpolate({
-                    inputRange: [0, 0.5, 1],
-                    outputRange: [0, -2, 0],
-                  }),
-                },
-              ],
-            }}>
-            <ThemedText style={styles.hintText}>
-              Swipe down to dismiss
+      <GestureDetector gesture={panGesture}>
+        <Animated.View
+          style={[
+            styles.messageContainer,
+            { backgroundColor: colors.background },
+            animatedContainerStyle,
+          ]}>
+          <View style={styles.header}>
+            <ThemedText style={styles.fromText}>
+              {isGroupMessage && groupName ? (
+                <>
+                  From: {groupName} (Group)
+                  {fromDisplayName && ` • ${fromDisplayName}`}
+                  {fromUsername && ` (@${fromUsername})`}
+                </>
+              ) : (
+                <>
+                  From: {fromDisplayName || fromUsername || 'Unknown'}
+                  {fromUsername && ` (@${fromUsername})`}
+                </>
+              )}
             </ThemedText>
-            <View style={styles.swipeIndicator}>
-              <IconSymbol name="chevron.down" size={24} color={colors.icon} />
-            </View>
-          </Animated.View>
-        </View>
-      </Animated.View>
+          </View>
+
+          <View style={styles.messageContent}>
+            <ThemedText type="title" style={styles.messageText}>
+              {message}
+            </ThemedText>
+          </View>
+
+          <View style={styles.footer}>
+            <Animated.View style={shimmerStyle}>
+              <ThemedText style={styles.hintText}>
+                Swipe down to dismiss
+              </ThemedText>
+              <View style={styles.swipeIndicator}>
+                <IconSymbol name="chevron.down" size={24} color={colors.icon} />
+              </View>
+            </Animated.View>
+          </View>
+        </Animated.View>
+      </GestureDetector>
     </ThemedView>
   );
 }

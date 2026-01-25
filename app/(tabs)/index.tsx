@@ -5,7 +5,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { isFriendMuted, isGroupMuted } from '@/utils/muteHelpers';
-import { validateStreak } from '@/utils/streakHelpers';
+import { validateAndSyncStreak } from '@/utils/streakHelpers';
 import React from 'react';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -285,8 +285,9 @@ export default function HomeScreen() {
           const friendData = friendDoc.data();
           const lastHootDate = data.lastHootDate || null;
           const rawStreakCount = data.streakCount || 0;
-          // Validate streak: reset to 0 if more than 1 day has passed
-          const validatedStreakCount = validateStreak(rawStreakCount, lastHootDate);
+          // Validate streak and sync to Firestore if broken (fire-and-forget)
+          // This ensures the database stays consistent even if the scheduled cleanup hasn't run
+          const validatedStreakCount = validateAndSyncStreak('friendships', docSnap.id, rawStreakCount, lastHootDate);
           return {
             id: docSnap.id,
             friendId: data.friendId,
@@ -308,14 +309,15 @@ export default function HomeScreen() {
         where('memberIds', 'array-contains', currentUserId)
       );
       const groupsSnapshot = await getDocs(groupsQuery);
-      const groupsList = groupsSnapshot.docs.map(doc => {
-        const data = doc.data();
+      const groupsList = groupsSnapshot.docs.map(docSnap => {
+        const data = docSnap.data();
         const lastHootDate = data.lastHootDate || null;
         const rawStreakCount = data.streakCount || 0;
-        // Validate streak: reset to 0 if more than 1 day has passed
-        const validatedStreakCount = validateStreak(rawStreakCount, lastHootDate);
+        // Validate streak and sync to Firestore if broken (fire-and-forget)
+        // This ensures the database stays consistent even if the scheduled cleanup hasn't run
+        const validatedStreakCount = validateAndSyncStreak('groups', docSnap.id, rawStreakCount, lastHootDate);
         return {
-          id: doc.id,
+          id: docSnap.id,
           name: data.name,
           memberIds: data.memberIds || [],
           streakCount: validatedStreakCount,
