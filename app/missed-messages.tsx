@@ -291,7 +291,7 @@ export default function MissedMessagesScreen() {
       Alert.alert('Error', 'Failed to dismiss messages');
       setDismissing(false);
     }
-  };
+  }, [messages, dismissing, params, router]);
 
   // Pan gesture for swipe-to-dismiss
   const panGesture = Gesture.Pan()
